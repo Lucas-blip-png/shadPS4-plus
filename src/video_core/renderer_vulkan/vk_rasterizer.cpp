@@ -1869,6 +1869,7 @@ void Rasterizer::ResetBindings(bool is_compute) {
     bound_images.clear();
     bound_buffers.clear();
     needs_barrier = false;
+    scheduler.PublishCommands();
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
