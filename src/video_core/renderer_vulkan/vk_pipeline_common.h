@@ -8,6 +8,7 @@
 #include "video_core/renderer_vulkan/vk_common.h"
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -40,6 +41,9 @@ public:
     virtual ~Pipeline();
 
     vk::Pipeline Handle() const noexcept {
+        if (optimize_job && optimize_job->done.load(std::memory_order_acquire)) [[unlikely]] {
+            SwapInOptimized();
+        }
         return *pipeline;
     }
 
@@ -147,11 +151,27 @@ protected:
     /// Whether count set-0 descriptors fit the device's push descriptor limit.
     [[nodiscard]] bool FitsPushDescriptors(u32 count) const;
 
+    /// The optimized build of a pipeline first built without optimizations, on a thread of its
+    /// own. done is set once result holds it, or once the build was cancelled.
+    struct OptimizeJob {
+        std::atomic<bool> done{};
+        std::atomic<bool> cancelled{};
+        vk::UniquePipeline result;
+    };
+    /// Queues build on the background compiler thread, which sets job's done after it.
+    static void SubmitOptimize(std::shared_ptr<OptimizeJob> job,
+                               std::function<vk::UniquePipeline()> build);
+    /// Replaces the pipeline with the optimized one; commands recorded so far keep the old one.
+    void SwapInOptimized() const noexcept;
+    /// Cancels the optimized build, or waits for it if it already started.
+    void CancelOptimize() noexcept;
+
     const Instance& instance;
     Scheduler& scheduler;
     DescriptorHeap& desc_heap;
     const Shader::Profile& profile;
-    vk::UniquePipeline pipeline;
+    mutable vk::UniquePipeline pipeline;
+    mutable std::shared_ptr<OptimizeJob> optimize_job;
     PipelineLayoutCache* layouts;
     vk::PipelineLayout pipeline_layout{};
     vk::DescriptorSetLayout desc_layout{};

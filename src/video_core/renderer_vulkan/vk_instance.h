@@ -245,6 +245,11 @@ public:
     }
 
     /// Returns true if the subgroup size can be set to match guest subgroup size
+    /// Returns true if creating a pipeline can be made to fail instead of compiling it.
+    bool IsPipelineCreationCacheControlSupported() const {
+        return vk13_features.pipelineCreationCacheControl;
+    }
+
     bool IsSubgroupSize64Supported() const {
         return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
     }

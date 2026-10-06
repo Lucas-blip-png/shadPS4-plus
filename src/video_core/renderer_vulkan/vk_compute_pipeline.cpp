@@ -3,7 +3,11 @@
 
 #include <boost/container/small_vector.hpp>
 
+#include <chrono>
+
+#include "common/logging/log.h"
 #include "shader_recompiler/info.h"
+#include "core/emulator_settings.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -81,18 +85,65 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     AssignLayouts(bindings, flags, push_constants, debug_str);
     const auto device = instance.GetDevice();
 
-    const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
-        .stage = shader_ci,
-        .layout = pipeline_layout,
+    // Also runs on the optimize thread, so it only uses what lives as long as this pipeline.
+    // Returns no pipeline when one may only come from the driver's cache and isn't there.
+    const auto create = [device, cache = pipeline_cache, layout = pipeline_layout, module,
+                         subgroup64 = instance.IsSubgroupSize64Supported(),
+                         debug_str](vk::PipelineCreateFlags flags) -> vk::UniquePipeline {
+        const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
+            .requiredSubgroupSize = 64,
+        };
+        const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
+            .flags = flags,
+            .stage{
+                .pNext = subgroup64 ? &subgroup_size_ci : nullptr,
+                .stage = vk::ShaderStageFlagBits::eCompute,
+                .module = module,
+                .pName = "main",
+            },
+            .layout = layout,
+        };
+        const auto start = std::chrono::steady_clock::now();
+        auto [pipeline_result, pipe] = device.createComputePipelineUnique(cache, compute_pipeline_ci);
+        if (pipeline_result == vk::Result::ePipelineCompileRequired) {
+            return {};
+        }
+        ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
+                   vk::to_string(pipeline_result));
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+        if (ms >= 20 || (flags & vk::PipelineCreateFlagBits::eDisableOptimization)) {
+            LOG_INFO(Render_Vulkan, "{}compute pipeline {} built in {} ms",
+                     flags & vk::PipelineCreateFlagBits::eDisableOptimization ? "Unoptimized "
+                                                                              : "",
+                     debug_str, ms);
+        }
+        SetObjectName(device, *pipe, "Compute Pipeline {}", debug_str);
+        return std::move(pipe);
     };
-    auto [pipeline_result, pipe] =
-        instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
-    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
-               vk::to_string(pipeline_result));
-    pipeline = std::move(pipe);
-    SetObjectName(device, *pipeline, "Compute Pipeline {}", debug_str);
+
+    // A dispatch waits on a pipeline met in game, and compute work can't be skipped. One the
+    // driver built before comes from its disk cache at once. A new one takes about 100 ms, and a
+    // new effect brings a few dozen, which froze the game for seconds: one built without
+    // optimizations, several times quicker, is used now and the optimized one replaces it.
+    if (!preloading && instance.IsPipelineCreationCacheControlSupported() &&
+        EmulatorSettings.IsComputeFastCompile()) {
+        if (!EmulatorSettings.IsComputeFastCompileForce()) {
+            pipeline = create(vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired);
+        }
+        if (!pipeline) {
+            optimize_job = std::make_shared<OptimizeJob>();
+            SubmitOptimize(optimize_job, [create] { return create({}); });
+            pipeline = create(vk::PipelineCreateFlagBits::eDisableOptimization);
+        }
+    } else {
+        pipeline = create({});
+    }
 }
 
-ComputePipeline::~ComputePipeline() = default;
+ComputePipeline::~ComputePipeline() {
+    CancelOptimize();
+}
 
 } // namespace Vulkan

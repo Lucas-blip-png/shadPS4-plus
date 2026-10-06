@@ -3,9 +3,14 @@
 
 #include <array>
 #include <bit>
+#include <condition_variable>
 #include <cstddef>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <limits>
+#include <mutex>
+#include <thread>
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
@@ -13,6 +18,7 @@
 #include <boost/container/static_vector.hpp>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/thread.h"
 
 #include "core/emulator_settings.h"
 #include "shader_recompiler/resource.h"
@@ -497,6 +503,78 @@ bool Pipeline::FitsPushDescriptors(u32 count) const {
     // equals it on the descriptor heap.
     static const bool full = EmulatorSettings.IsPushDescFullLimit();
     return full ? count <= instance.MaxPushDescriptors() : count < instance.MaxPushDescriptors();
+}
+
+namespace {
+// ponytail: one thread, so a burst of new pipelines gets optimized one after another; more
+// threads if the unoptimized ones stay in use long enough to cost frames.
+class OptimizeThread {
+public:
+    static OptimizeThread& Instance() {
+        static OptimizeThread instance;
+        return instance;
+    }
+
+    void Submit(std::function<void()> work) {
+        {
+            std::scoped_lock lk{mutex};
+            queue.push_back(std::move(work));
+        }
+        cv.notify_one();
+    }
+
+private:
+    OptimizeThread() : thread{[this](std::stop_token stop) { Run(stop); }} {}
+
+    void Run(std::stop_token stop) {
+        Common::SetCurrentThreadName("PipelineOptimize");
+        while (true) {
+            std::unique_lock lk{mutex};
+            if (!cv.wait(lk, stop, [this] { return !queue.empty(); })) {
+                return;
+            }
+            auto work = std::move(queue.front());
+            queue.pop_front();
+            lk.unlock();
+            work();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::deque<std::function<void()>> queue;
+    std::jthread thread;
+};
+} // Anonymous namespace
+
+void Pipeline::SubmitOptimize(std::shared_ptr<OptimizeJob> job,
+                              std::function<vk::UniquePipeline()> build) {
+    OptimizeThread::Instance().Submit([job = std::move(job), build = std::move(build)] {
+        if (!job->cancelled.load(std::memory_order_acquire)) {
+            job->result = build();
+        }
+        job->done.store(true, std::memory_order_release);
+        job->done.notify_all();
+    });
+}
+
+void Pipeline::SwapInOptimized() const noexcept {
+    const auto job = std::move(optimize_job);
+    if (!job->result) {
+        return;
+    }
+    scheduler.DeferOperation([old = std::move(pipeline)]() mutable { old.reset(); });
+    pipeline = std::move(job->result);
+}
+
+void Pipeline::CancelOptimize() noexcept {
+    if (!optimize_job) {
+        return;
+    }
+    // The build reads the layout and the pipeline cache, which die with this pipeline.
+    optimize_job->cancelled.store(true, std::memory_order_release);
+    optimize_job->done.wait(false, std::memory_order_acquire);
+    optimize_job.reset();
 }
 
 Pipeline::~Pipeline() {
