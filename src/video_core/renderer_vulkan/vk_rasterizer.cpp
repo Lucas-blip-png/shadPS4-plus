@@ -195,10 +195,15 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             [] { VideoCore::StreamCopyLane::Instance().DrainRemote(); });
     }
 
+    runtime.track_open_writes = static_cast<bool>(instance.GetTransferQueue());
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         // A query cannot span command buffers: its end event takes the fake path.
         EndOcclusionQuery();
         runtime.FlushBarriers();
+        if (runtime.track_open_writes) {
+            runtime.RetireOpenWrites(scheduler.CurrentTick() - 1);
+            runtime.ResetOpenBatch();
+        }
         buffer_cache.SubmitPendingArenaBinds(info);
     });
 }
@@ -1598,6 +1603,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     if (uses_dma) {
+        runtime.MarkOpenWild();
         buffer_cache.SynchronizeDmaBuffers();
     }
 

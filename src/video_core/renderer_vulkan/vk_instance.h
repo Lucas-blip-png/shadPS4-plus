@@ -71,6 +71,14 @@ public:
         return graphics_queue;
     }
 
+    /// A queue of a transfer-only family when readback_transfer_queue is on, else null.
+    vk::Queue GetTransferQueue() const {
+        return transfer_queue;
+    }
+    u32 GetTransferQueueFamilyIndex() const {
+        return transfer_queue_family_index;
+    }
+
     vk::Queue GetPresentQueue() const {
         return present_queue;
     }
@@ -523,6 +531,8 @@ private:
     std::string vendor_name;
     VmaAllocator allocator{};
     vk::Queue present_queue;
+    vk::Queue transfer_queue;
+    u32 transfer_queue_family_index{0};
     vk::Queue graphics_queue;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;

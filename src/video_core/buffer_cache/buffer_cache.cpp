@@ -61,7 +61,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       memory_tracker{std::make_unique<MemoryTracker>(tracker)},
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
-      memory_semaphore{instance} {
+      memory_semaphore{instance}, transfer_semaphore{instance} {
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -208,6 +208,7 @@ struct BufferCache::Readback {
     u64 write_seq{};
     u64 tick{};
     bool busy{};
+    bool transfer{};
 };
 
 bool BufferCache::OffloadReadback(VAddr device_addr, u64 size, bool is_write) {
@@ -236,7 +237,7 @@ bool BufferCache::OffloadReadback(VAddr device_addr, u64 size, bool is_write) {
         } else {
             ++attempts;
             if (!job.copies.empty()) {
-                scheduler.GetWorkSemaphore()->Wait(job.tick);
+                (job.transfer ? &transfer_semaphore : scheduler.GetWorkSemaphore())->Wait(job.tick);
                 FinishReadback(job);
             }
         }
@@ -263,6 +264,11 @@ void BufferCache::RecordReadback(Readback& job) {
         }
         MergeReadbackReturns();
     }
+    // Before the copy is recorded: unless the open batch wrote the window, every write to it is
+    // in a submitted batch.
+    const bool submitted_only = instance.GetTransferQueue() &&
+                                !runtime.OpenWritesOverlap(job.window, READBACK_WINDOW_SIZE) &&
+                                !runtime.OpenWild() && pending_binds.empty();
     const u64 block = job.window >> block_shift;
     const auto* arena = GetArena(block, block);
     const u64 total_size_bytes =
@@ -277,11 +283,99 @@ void BufferCache::RecordReadback(Readback& job) {
     }
     job.arena_base = arena->cpu_addr;
     job.write_seq = memory_tracker->GpuWriteSeq(job.window, READBACK_WINDOW_SIZE);
-    runtime.CopyBuffer(arena, job.staging.buffer, job.copies);
-    job.tick = scheduler.CurrentTick();
-    scheduler.Flush();
+    if (submitted_only) {
+        // Only the last batch in flight that wrote the window, or else one the GPU already
+        // passed, which makes the earlier writes visible.
+        const u64 writer = runtime.LastWriterTick(job.window, READBACK_WINDOW_SIZE);
+        const u64 gfx_value = writer ? writer : scheduler.GetWorkSemaphore()->KnownGpuTick();
+        job.tick = SubmitTransferCopy(arena->Handle(), job.staging.buffer->Handle(), job.copies,
+                                      gfx_value);
+        job.transfer = true;
+    } else {
+        runtime.CopyBuffer(arena, job.staging.buffer, job.copies);
+        job.tick = scheduler.CurrentTick();
+        scheduler.Flush();
+    }
     std::scoped_lock lk{readback_mutex};
     pending_readbacks.push_back(job.window);
+}
+
+u64 BufferCache::SubmitTransferCopy(vk::Buffer src, vk::Buffer dst,
+                                    std::span<const vk::BufferCopy> copies, u64 gfx_value) {
+    const vk::Device device = instance.GetDevice();
+    if (!transfer_pool) {
+        auto [pool_result, pool] = device.createCommandPoolUnique({
+            .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+            .queueFamilyIndex = instance.GetTransferQueueFamilyIndex(),
+        });
+        ASSERT(pool_result == vk::Result::eSuccess);
+        transfer_pool = std::move(pool);
+        const vk::CommandBufferAllocateInfo alloc_info = {
+            .commandPool = *transfer_pool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = static_cast<u32>(transfer_cmdbufs.size()),
+        };
+        ASSERT(device.allocateCommandBuffers(&alloc_info, transfer_cmdbufs.data()) ==
+               vk::Result::eSuccess);
+    }
+    // ponytail: the arena and staging buffers are exclusive to the graphics family and are used
+    // here without an ownership transfer, which the drivers tested tolerate.
+    const u32 slot = transfer_index++ % transfer_cmdbufs.size();
+    transfer_semaphore.Wait(transfer_values[slot]);
+    const vk::CommandBuffer cmdbuf = transfer_cmdbufs[slot];
+    ASSERT(cmdbuf.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}) ==
+           vk::Result::eSuccess);
+    cmdbuf.copyBuffer(src, dst, static_cast<u32>(copies.size()), copies.data());
+    const vk::MemoryBarrier2 barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
+    ASSERT(cmdbuf.end() == vk::Result::eSuccess);
+
+    // No wait before signal: the recording thread may not have submitted the writer yet.
+    scheduler.WaitSubmitted(gfx_value);
+    std::array<vk::Semaphore, 2> waits;
+    std::array<u64, 2> wait_values;
+    std::array<vk::PipelineStageFlags, 2> wait_stages;
+    u32 num_waits = 0;
+    const auto add_wait = [&](vk::Semaphore sema, u64 value) {
+        if (value != 0) {
+            waits[num_waits] = sema;
+            wait_values[num_waits] = value;
+            wait_stages[num_waits] = vk::PipelineStageFlagBits::eAllCommands;
+            ++num_waits;
+        }
+    };
+    add_wait(scheduler.GetWorkSemaphore()->Handle(), gfx_value);
+    add_wait(memory_semaphore.Handle(), memory_semaphore.CurrentTick() - 1);
+    const u64 value = transfer_semaphore.NextTick();
+    const vk::Semaphore signal = transfer_semaphore.Handle();
+    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+        .waitSemaphoreValueCount = num_waits,
+        .pWaitSemaphoreValues = wait_values.data(),
+        .signalSemaphoreValueCount = 1,
+        .pSignalSemaphoreValues = &value,
+    };
+    const vk::SubmitInfo submit_info = {
+        .pNext = &timeline_si,
+        .waitSemaphoreCount = num_waits,
+        .pWaitSemaphores = waits.data(),
+        .pWaitDstStageMask = wait_stages.data(),
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmdbuf,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &signal,
+    };
+    const auto result = instance.GetTransferQueue().submit(submit_info);
+    ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost during transfer readback");
+    transfer_values[slot] = value;
+    return value;
 }
 
 void BufferCache::FinishReadback(const Readback& job) {
@@ -341,6 +435,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        runtime.NoteOpenWrite(device_addr, size);
     }
     return {arena, arena->Offset(device_addr)};
 }

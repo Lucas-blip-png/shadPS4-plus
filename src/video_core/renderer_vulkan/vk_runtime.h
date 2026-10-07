@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <deque>
+
 #include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -92,6 +94,28 @@ public:
 
     void FlushBarriers();
 
+    /// readback_transfer_queue: page-rounded guest ranges the open command buffer writes, kept
+    /// with the tick of each submitted batch until the GPU finishes it.
+    bool track_open_writes{};
+    void NoteOpenWrite(VAddr addr, u64 size);
+    void RetireOpenWrites(u64 tick);
+    /// Tick of the latest submitted batch still in flight that wrote the range, or 0.
+    [[nodiscard]] u64 LastWriterTick(VAddr addr, u64 size);
+    void ResetOpenBatch() {
+        open_writes.Clear();
+        open_wild = false;
+    }
+    /// The open batch has work that writes guest memory it does not name (DMA).
+    void MarkOpenWild() {
+        open_wild = true;
+    }
+    [[nodiscard]] bool OpenWild() const {
+        return open_wild;
+    }
+    [[nodiscard]] bool OpenWritesOverlap(VAddr addr, u64 size) const {
+        return open_writes.Overlaps(addr, addr + size);
+    }
+
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);
 
@@ -115,6 +139,15 @@ private:
     u64 barrier_skips{};
     const VideoCore::Buffer* untracked_buffer{};
     u64 untracked_skips{};
+    IntervalList<Interval> open_writes;
+    bool open_wild{};
+    struct InflightWrites {
+        u64 tick;
+        bool wild;
+        IntervalList<Interval> writes;
+    };
+    std::deque<InflightWrites> inflight_writes;
+    u64 overflow_tick{};
 };
 
 } // namespace Vulkan

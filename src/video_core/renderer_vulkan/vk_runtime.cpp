@@ -744,6 +744,9 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
     };
     if (src_access & WRITE_MASK) {
         add(resource->write_ranges);
+        if (handle->mem_type == VideoCore::MemoryType::Sparse) {
+            NoteOpenWrite(handle->CpuAddr() + offset, size);
+        }
     }
     if (src_access & READ_MASK) {
         add(resource->read_ranges);
@@ -751,6 +754,38 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
 
     memory_barrier.srcStageMask |= src_stage;
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
+}
+
+void Runtime::RetireOpenWrites(u64 tick) {
+    while (!inflight_writes.empty() &&
+           (scheduler.IsFree(inflight_writes.front().tick) || inflight_writes.size() > 256)) {
+        overflow_tick = std::max(overflow_tick, inflight_writes.front().tick);
+        inflight_writes.pop_front();
+    }
+    if (!open_writes.Empty() || open_wild) {
+        inflight_writes.push_back({tick, open_wild, open_writes});
+    }
+}
+
+void Runtime::NoteOpenWrite(VAddr addr, u64 size) {
+    if (!track_open_writes || size == 0) {
+        return;
+    }
+    const VAddr start = Common::AlignDown(addr, 4_KB);
+    const VAddr end = Common::AlignUp(addr + size, 4_KB);
+    if (open_writes.FindCovering(start, end) == open_writes.end()) {
+        open_writes.Add(Interval{.start = start, .end = end});
+    }
+}
+
+u64 Runtime::LastWriterTick(VAddr addr, u64 size) {
+    for (auto it = inflight_writes.rbegin(); it != inflight_writes.rend(); ++it) {
+        if (it->wild || it->writes.Overlaps(addr, addr + size)) {
+            return it->tick;
+        }
+    }
+    // A batch dropped from the list while in flight may have written the range.
+    return scheduler.IsFree(overflow_tick) ? 0 : overflow_tick;
 }
 
 void Runtime::FlushBarriers() {

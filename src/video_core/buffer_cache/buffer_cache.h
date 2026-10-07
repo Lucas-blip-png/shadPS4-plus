@@ -155,6 +155,12 @@ private:
     /// marked in it since the copy.
     void FinishReadback(const Readback& job);
 
+    /// readback_transfer_queue: copies a readback window on the transfer queue once the work
+    /// semaphore reaches gfx_value and the sparse binds submitted so far are done. Returns the
+    /// value of transfer_semaphore it signals.
+    u64 SubmitTransferCopy(vk::Buffer src, vk::Buffer dst, std::span<const vk::BufferCopy> copies,
+                           u64 gfx_value);
+
     /// True when a pending readback window overlaps the range. Requires readback_mutex.
     bool IsReadbackPending(VAddr addr, u64 size) const;
 
@@ -191,6 +197,11 @@ private:
     std::deque<Buffer> arenas;
     std::vector<ArenaBinds> pending_binds;
     Vulkan::Semaphore memory_semaphore;
+    Vulkan::Semaphore transfer_semaphore;
+    vk::UniqueCommandPool transfer_pool;
+    std::array<vk::CommandBuffer, 16> transfer_cmdbufs{};
+    std::array<u64, 16> transfer_values{};
+    u32 transfer_index{};
 
     struct Backing : public Interval {
         vk::DeviceMemory memory;
