@@ -2125,7 +2125,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         } else {
             const auto vsharp = desc.GetSharp(stage);
-            if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+            // A stale V# (draws the game predicates away still run, IT_SET_PREDICATION is not
+            // implemented) can point outside the guest address space: bind null like a zero one
+            if (vsharp.base_address == 0 || vsharp.GetSize() == 0 ||
+                !memory->IsValidMapping(vsharp.base_address)) {
                 buffer_infos[info_n++] = vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());

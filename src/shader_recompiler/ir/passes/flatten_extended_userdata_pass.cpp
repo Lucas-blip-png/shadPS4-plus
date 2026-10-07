@@ -30,9 +30,26 @@ using namespace Xbyak::util;
 static Xbyak::CodeGenerator g_srt_codegen(32_MB);
 static const u8* g_srt_codegen_start = nullptr;
 
+namespace {
+bool SrtWalkerSignalHandler(void* context, void* fault_address);
+
+// Walkers loaded from the pipeline cache never go through GenerateSrtProgram, so whichever path
+// comes first registers the fault handler, for the whole code buffer
+void EnsureSrtSignalHandler() {
+    if (g_srt_codegen_start == nullptr) {
+        g_srt_codegen_start = g_srt_codegen.getCode();
+        // Call after the memory invalidation handler
+        constexpr u32 priority = 1;
+        Core::Signals::Instance()->RegisterAccessViolationHandler(SrtWalkerSignalHandler,
+                                                                  priority);
+    }
+}
+} // namespace
+
 namespace Shader {
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
+    EnsureSrtSignalHandler();
     const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
     g_srt_codegen.db(ptr, size);
     g_srt_codegen.ready();
@@ -68,7 +85,7 @@ static void DumpSrtProgram(const Shader::Info& info, const u8* code, size_t code
     }
 }
 
-static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
+bool SrtWalkerSignalHandler(void* context, void* fault_address) {
     // Only handle if the fault address is within the SRT code range
     const u8* code_start = g_srt_codegen_start;
     const u8* code_end = code_start + g_srt_codegen.getSize();
@@ -87,35 +104,25 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
            operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
            operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY);
 
-    size_t len = instruction.length;
-    const size_t patch_size = 3;
-    u8* code_patch = const_cast<u8*>(reinterpret_cast<const u8*>(code));
-
-    // We can only encounter rdi or r10d as the first operand in a
+    // Skip only this execution of the load and zero its destination. Patching the code would zero
+    // the value for every later run of the walker, which is shared by all draws of the shader, even
+    // once the guest pointer is valid. We can only encounter rdi or r10d as the first operand in a
     // fault memory access for SRT walker.
     switch (operands[0].reg.value) {
     case ZYDIS_REGISTER_RDI:
-        // mov rdi, [rdi + (off_dw << 2)] -> xor rdi, rdi
-        code_patch[0] = 0x48;
-        code_patch[1] = 0x31;
-        code_patch[2] = 0xFF;
+        Common::SetX64Gpr(context, Common::X64Gpr::Rdi, 0);
         break;
     case ZYDIS_REGISTER_R10D:
-        // mov r10d, [rdi + (off_dw << 2)] -> xor r10d, r10d
-        code_patch[0] = 0x45;
-        code_patch[1] = 0x31;
-        code_patch[2] = 0xD2;
+        Common::SetX64Gpr(context, Common::X64Gpr::R10, 0);
         break;
     default:
-        UNREACHABLE_MSG("Unsupported register for SRT walker patch");
+        UNREACHABLE_MSG("Unsupported register for SRT walker fault");
         return false;
     }
+    Common::IncrementRip(context, instruction.length);
 
-    // Fill nops
-    memset(code_patch + patch_size, 0x90, len - patch_size);
-
-    LOG_WARNING(Render_Recompiler, "Patched SRT walker at {}, fault address {}", code,
-                fault_address);
+    LOG_DEBUG(Render_Recompiler, "Skipped faulting SRT walker load at {}, fault address {}", code,
+              fault_address);
 
     return true;
 }
@@ -640,14 +647,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
         return;
     }
 
-    // Register the signal handler for SRT walker, if not already registered
-    if (g_srt_codegen_start == nullptr) {
-        g_srt_codegen_start = c.getCurr();
-        auto* signals = Core::Signals::Instance();
-        // Call after the memory invalidation handler
-        constexpr u32 priority = 1;
-        signals->RegisterAccessViolationHandler(SrtWalkerSignalHandler, priority);
-    }
+    EnsureSrtSignalHandler();
 
     info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
     pass_info.dst_off_dw = NUM_USER_DATA_REGS;
