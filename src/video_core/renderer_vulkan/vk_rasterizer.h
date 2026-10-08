@@ -161,6 +161,9 @@ private:
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
+    /// Sets each sampled image descriptor's layout to the one its subresource is in after the
+    /// last transition of the command.
+    void RefreshImageDescriptorLayouts();
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);
@@ -460,6 +463,15 @@ private:
     ImageBinding db_desc;
 
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
+    // Sampled image descriptors of the current bind, for RefreshImageDescriptorLayouts. The
+    // backing is kept by index: adding a backing can move the others.
+    struct ImageDescriptorRef {
+        u32 info_index;
+        VideoCore::ImageId image_id;
+        u32 backing_index;
+        u32 subres_idx;
+    };
+    boost::container::static_vector<ImageDescriptorRef, Shader::NUM_IMAGES> image_descriptor_refs;
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;
         u64 offset;

@@ -662,6 +662,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         runtime.FlushBarriers();
     }
 
+    RefreshImageDescriptorLayouts();
     pipeline->BindResources({bind_writes_, bind_write_n_}, push_data, bind_buffer_n_,
                             bind_image_n_);
     // Dyn term, after the scope replay wrote attachment_feedback_loop.
@@ -861,6 +862,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         runtime.FlushBarriers();
     }
 
+    RefreshImageDescriptorLayouts();
     pipeline->BindResources({bind_writes_, bind_write_n_}, push_data, bind_buffer_n_,
                             bind_image_n_);
     UpdateDynamicState(pipeline, is_indexed);
@@ -927,6 +929,7 @@ void Rasterizer::DispatchDirect() {
     }
 
     scheduler.EndRendering();
+    RefreshImageDescriptorLayouts();
     pipeline->BindResources({bind_writes_, bind_write_n_}, push_data, bind_buffer_n_,
                             bind_image_n_);
 
@@ -969,6 +972,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     }
 
     scheduler.EndRendering();
+    RefreshImageDescriptorLayouts();
     pipeline->BindResources({bind_writes_, bind_write_n_}, push_data, bind_buffer_n_,
                             bind_image_n_);
 
@@ -1519,6 +1523,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     set_writes.clear();
     buffer_info_n_ = 0;
     image_infos.clear();
+    image_descriptor_refs.clear();
     // A ready plan stands in for the write list this bind would rebuild; the
     // passes below still fill the info arrays the plan's entries point at.
     auto& plan = pipeline->bind_plan;
@@ -2381,6 +2386,15 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 }
             }
             AppendImageInfo(image_infos, VK_NULL_HANDLE, image_view, bound_layout);
+            if (!is_storage) {
+                const auto& range = desc.view_info.range;
+                image_descriptor_refs.push_back({
+                    .info_index = static_cast<u32>(image_infos.size() - 1),
+                    .image_id = image_id,
+                    .backing_index = static_cast<u32>(image.backing - image.backing_images.data()),
+                    .subres_idx = range.base.level * image.info.resources.layers + range.base.layer,
+                });
+            }
         }
     }
 
@@ -2765,6 +2779,37 @@ void Rasterizer::BrPopulate(const RenderState& fresh, const VideoCore::Skipcache
     br_cache_.token = token;
     br_cache_.valid = true;
     sc.NotifyPopulated(VideoCore::Skipcache::CacheId::BeginRendering);
+}
+
+static bool IsSampledImageLayout(vk::ImageLayout layout) {
+    switch (layout) {
+    case vk::ImageLayout::eGeneral:
+    case vk::ImageLayout::eShaderReadOnlyOptimal:
+    case vk::ImageLayout::eDepthStencilReadOnlyOptimal:
+    case vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal:
+    case vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal:
+    case vk::ImageLayout::eDepthReadOnlyOptimal:
+    case vk::ImageLayout::eStencilReadOnlyOptimal:
+    case vk::ImageLayout::eReadOnlyOptimal:
+    case vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void Rasterizer::RefreshImageDescriptorLayouts() {
+    // A later transition of the same command (a sampled depth image that is also the depth
+    // attachment, another binding of the same image) can move a subresource out of the layout its
+    // descriptor was written with. A layout a sampled image cannot be in has no valid choice, so
+    // the descriptor keeps the one it had.
+    for (const auto& ref : image_descriptor_refs) {
+        const auto& image = texture_cache.GetImage(ref.image_id);
+        const auto layout = image.backing_images[ref.backing_index].Layout(ref.subres_idx);
+        if (IsSampledImageLayout(layout)) {
+            image_infos[ref.info_index].imageLayout = layout;
+        }
+    }
 }
 
 const RenderState& Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
