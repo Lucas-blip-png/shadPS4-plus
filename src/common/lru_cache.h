@@ -39,7 +39,9 @@ public:
 
     void Touch(ObjectType& obj, TickType tick) {
         Node& node = FromObject(obj);
-        if (node.tick >= tick) {
+        // A freed node must stay out: relinking it would let the slot's next Insert link it a
+        // second time and turn the list into a cycle that ForEachItemBelow never leaves.
+        if (!node.linked || node.tick >= tick) {
             return;
         }
         node.tick = tick;
