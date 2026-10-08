@@ -132,6 +132,11 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
+    vk::ResultValue<vk::DeviceMemory> AllocateArenaMemory(u64 size) const;
+
+    /// Up to `size` bytes of arena memory from the current chunk: its memory, offset and size.
+    std::tuple<vk::DeviceMemory, u64, u64> AllocateArenaPiece(u64 size);
+
     /// True when every block in [first_block, last_block] has its residency bit set.
     bool AllResident(u64 first_block, u64 last_block) const;
 
@@ -216,6 +221,16 @@ private:
     IntervalList<Backing> resident_ranges;
 
     u32 arena_memory_type_index{};
+    /// With arena_reserve_mb set, arena memory is taken from 256 MB chunks, that many of them
+    /// reserved at boot: on 8 GB cards images otherwise fill VRAM first and residency later finds
+    /// none left. Without it, each EnsureResident call makes one allocation sized for its ranges.
+    static constexpr u64 ARENA_CHUNK_SIZE = 256_MB;
+    bool arena_chunked{};
+    std::vector<vk::DeviceMemory> arena_spare_chunks;
+    vk::DeviceMemory arena_chunk{};
+    u64 arena_chunk_size{};
+    u64 arena_chunk_used{};
+    u64 arena_resident_bytes{};
     u32 block_size{};
     u32 block_shift{};
     u32 blocks_per_arena_page{};

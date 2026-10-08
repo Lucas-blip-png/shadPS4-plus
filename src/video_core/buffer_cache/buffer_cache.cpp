@@ -84,6 +84,21 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
                        reqs.memoryTypeBits)
             .value();
+    const u64 arena_reserve = u64{EmulatorSettings.GetArenaReserveMb()} << 20;
+    arena_chunked = arena_reserve != 0;
+    for (u64 reserved = 0; reserved < arena_reserve; reserved += ARENA_CHUNK_SIZE) {
+        const auto [result, chunk] = AllocateArenaMemory(ARENA_CHUNK_SIZE);
+        if (result != vk::Result::eSuccess) {
+            LOG_WARNING(Render, "Arena reserve stopped at {} MiB: {}", reserved >> 20,
+                        vk::to_string(result));
+            break;
+        }
+        arena_spare_chunks.push_back(chunk);
+    }
+    if (!arena_spare_chunks.empty()) {
+        LOG_WARNING(Render, "Arena reserve: {} MiB of VRAM",
+                    (arena_spare_chunks.size() * ARENA_CHUNK_SIZE) >> 20);
+    }
 
     const u64 bda_pagetable_size =
         (blocks_per_arena_page * NUM_ARENA_PAGES) * sizeof(vk::DeviceAddress);
@@ -578,6 +593,43 @@ bool BufferCache::AllResident(u64 first_block, u64 last_block) const {
     return true;
 }
 
+vk::ResultValue<vk::DeviceMemory> BufferCache::AllocateArenaMemory(u64 size) const {
+    const vk::MemoryAllocateFlagsInfo alloc_flags = {
+        .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
+    };
+    const vk::MemoryAllocateInfo alloc_info = {
+        .pNext = &alloc_flags,
+        .allocationSize = size,
+        .memoryTypeIndex = arena_memory_type_index,
+    };
+    return instance.GetDevice().allocateMemory(alloc_info);
+}
+
+std::tuple<vk::DeviceMemory, u64, u64> BufferCache::AllocateArenaPiece(u64 size) {
+    if (arena_chunk_used == arena_chunk_size) {
+        if (!arena_spare_chunks.empty()) {
+            arena_chunk = arena_spare_chunks.back();
+            arena_spare_chunks.pop_back();
+        } else {
+            auto chunk = AllocateArenaMemory(ARENA_CHUNK_SIZE);
+            if (chunk.result != vk::Result::eSuccess) {
+                LOG_CRITICAL(Render,
+                             "Arena allocation failed with {} MiB resident, device memory used "
+                             "{} MiB",
+                             arena_resident_bytes >> 20, instance.GetDeviceMemoryUsage() >> 20);
+            }
+            arena_chunk = Vulkan::Check(std::move(chunk));
+        }
+        arena_chunk_size = ARENA_CHUNK_SIZE;
+        arena_chunk_used = 0;
+    }
+    const u64 take = std::min(size, arena_chunk_size - arena_chunk_used);
+    const u64 offset = arena_chunk_used;
+    arena_chunk_used += take;
+    arena_resident_bytes += take;
+    return {arena_chunk, offset, take};
+}
+
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
     if (!resident_bits.empty()) {
         ++fast_stats.resident_checks;
@@ -597,51 +649,52 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         return;
     }
 
-    const vk::MemoryAllocateFlagsInfo alloc_flags = {
-        .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
-    };
-    const vk::MemoryAllocateInfo alloc_info = {
-        .pNext = &alloc_flags,
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
-    };
-    const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+    if (!arena_chunked) {
+        arena_chunk_size = u64{resident_blocks} << block_shift;
+        arena_chunk = Vulkan::Check(AllocateArenaMemory(arena_chunk_size));
+        arena_chunk_used = 0;
+    }
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
         staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
 
-    u64 memory_offset{};
     ArenaBinds* binds = BindsForArena(arena);
     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
     u64 offset = staging.offset;
     for (const auto& range : bind_ranges) {
-        Backing backing;
-        backing.start = range.start;
-        backing.end = range.end;
-        backing.memory = device_memory;
-        backing.offset = memory_offset >> block_shift;
-        resident_ranges.Add(backing);
-        for (u64 block = range.start; block < range.end && !resident_bits.empty(); ++block) {
-            resident_bits[block >> 6] |= u64{1} << (block & 63);
+        // A range larger than what is left of a chunk is bound from several of them
+        for (u64 piece_start = range.start; piece_start < range.end;) {
+            const auto [device_memory, memory_offset, piece_bytes] =
+                AllocateArenaPiece((range.end - piece_start) << block_shift);
+            const u64 piece_end = piece_start + (piece_bytes >> block_shift);
+            Backing backing;
+            backing.start = piece_start;
+            backing.end = piece_end;
+            backing.memory = device_memory;
+            backing.offset = memory_offset >> block_shift;
+            resident_ranges.Add(backing);
+            for (u64 block = piece_start; block < piece_end && !resident_bits.empty(); ++block) {
+                resident_bits[block >> 6] |= u64{1} << (block & 63);
+            }
+
+            LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
+
+            const auto& bind = binds->binds.emplace_back(vk::SparseMemoryBind{
+                .resourceOffset = (piece_start << block_shift) - arena->cpu_addr,
+                .size = piece_bytes,
+                .memory = device_memory,
+                .memoryOffset = memory_offset,
+            });
+
+            for (u64 block = 0; block < bind.size; block += block_size) {
+                *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
+            }
+            const u64 copy_size = (backing.end - backing.start) * sizeof(vk::DeviceAddress);
+            copies.emplace_back(offset, backing.start * sizeof(vk::DeviceAddress), copy_size);
+            offset += copy_size;
+            piece_start = piece_end;
         }
-
-        LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
-
-        const auto& bind = binds->binds.emplace_back(vk::SparseMemoryBind{
-            .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
-            .size = (range.end - range.start) << block_shift,
-            .memory = device_memory,
-            .memoryOffset = memory_offset,
-        });
-        memory_offset += bind.size;
-
-        for (u32 block = 0; block < bind.size; block += block_size) {
-            *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
-        }
-        const u64 copy_size = (backing.end - backing.start) * sizeof(vk::DeviceAddress);
-        copies.emplace_back(offset, backing.start * sizeof(vk::DeviceAddress), copy_size);
-        offset += copy_size;
     }
 
     staging.Flush();
