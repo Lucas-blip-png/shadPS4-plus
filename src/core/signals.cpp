@@ -27,6 +27,38 @@ namespace Core {
 
 #if defined(_WIN32)
 
+// Kept out of SignalHandler so the guest context (about 1.3 KB) is not reserved on every memory
+// tracking fault; a game fiber may have only 16 KiB of stack
+static SHAD_NO_INLINE LONG HandleUnclaimedException(EXCEPTION_POINTERS* pExp, DWORD code,
+                                                    PVOID address, s32 signo, s32 si_code,
+                                                    bool static_protection_exception) {
+    using namespace Libraries::Kernel;
+    const bool use_static_windows_guest_red_zone_protection =
+        WindowsGuestRedZoneProtection::IsStaticPatchingEnabled();
+
+    if (signo != 0) {
+        Ucontext guest_context{pExp->ContextRecord};
+        Siginfo guest_info{
+            ._si_signo = signo,
+            ._si_errno = 0,
+            ._si_code = si_code,
+            ._si_addr = (void*)guest_context.uc_mcontext.mc_rip,
+        };
+        if (g_curthread && g_curthread->DispatchSignal(signo, &guest_info, &guest_context)) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+
+    const bool report_unhandled =
+        use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
+    if (report_unhandled) {
+        LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        Common::Singleton<Core::Emulator>::Instance()->Shutdown();
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
     const auto* signals = Signals::Instance();
@@ -41,27 +73,22 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         address = pExp->ExceptionRecord->ExceptionAddress;
     }
 
-    Ucontext guest_context{pExp->ContextRecord};
-    Siginfo guest_info{
-        ._si_signo = 0,
-        ._si_errno = 0,
-        ._si_code = POSIX_SI_NOINFO,
-        ._si_addr = (void*)guest_context.uc_mcontext.mc_rip,
-    };
+    s32 signo = 0;
+    s32 si_code = POSIX_SI_NOINFO;
 
     bool handled = false;
     bool static_protection_exception = false; // Windows static guest red-zone protection
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION:
-        guest_info._si_signo = POSIX_SIGSEGV;
-        guest_info._si_code = POSIX_SEGV_MAPERR;
+        signo = POSIX_SIGSEGV;
+        si_code = POSIX_SEGV_MAPERR;
         static_protection_exception = true; // Windows static guest red-zone protection
         handled = signals->DispatchAccessViolation(
             pExp, reinterpret_cast<void*>(pExp->ExceptionRecord->ExceptionInformation[1]));
         break;
     case EXCEPTION_ILLEGAL_INSTRUCTION:
-        guest_info._si_signo = POSIX_SIGILL;
-        guest_info._si_code = POSIX_ILL_ILLOPC;
+        signo = POSIX_SIGILL;
+        si_code = POSIX_ILL_ILLOPC;
         static_protection_exception = true; // Windows static guest red-zone protection
         handled = signals->DispatchIllegalInstruction(pExp);
         break;
@@ -72,49 +99,49 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         }
         break;
     case EXCEPTION_IN_PAGE_ERROR:
-        guest_info._si_signo = POSIX_SIGBUS;
-        guest_info._si_code = POSIX_BUS_ADRALN;
+        signo = POSIX_SIGBUS;
+        si_code = POSIX_BUS_ADRALN;
         break;
     case EXCEPTION_INT_DIVIDE_BY_ZERO:
-        guest_info._si_signo = POSIX_SIGFPE;
-        guest_info._si_code = POSIX_FPE_INTDIV;
+        signo = POSIX_SIGFPE;
+        si_code = POSIX_FPE_INTDIV;
         break;
     case EXCEPTION_INT_OVERFLOW:
-        guest_info._si_signo = POSIX_SIGFPE;
-        guest_info._si_code = POSIX_FPE_INTOVF;
+        signo = POSIX_SIGFPE;
+        si_code = POSIX_FPE_INTOVF;
         break;
     case EXCEPTION_FLT_DIVIDE_BY_ZERO:
-        guest_info._si_signo = POSIX_SIGFPE;
-        guest_info._si_code = POSIX_FPE_FLTDIV;
+        signo = POSIX_SIGFPE;
+        si_code = POSIX_FPE_FLTDIV;
         break;
     case EXCEPTION_FLT_INVALID_OPERATION:
-        guest_info._si_signo = POSIX_SIGFPE;
-        guest_info._si_code = POSIX_FPE_FLTINV;
+        signo = POSIX_SIGFPE;
+        si_code = POSIX_FPE_FLTINV;
         break;
     case EXCEPTION_FLT_OVERFLOW:
-        guest_info._si_signo = POSIX_SIGFPE;
-        guest_info._si_code = POSIX_FPE_FLTOVF;
+        signo = POSIX_SIGFPE;
+        si_code = POSIX_FPE_FLTOVF;
         break;
     case EXCEPTION_FLT_UNDERFLOW:
-        guest_info._si_signo = POSIX_SIGFPE;
-        guest_info._si_code = POSIX_FPE_FLTUND;
+        signo = POSIX_SIGFPE;
+        si_code = POSIX_FPE_FLTUND;
         break;
     case EXCEPTION_FLT_DENORMAL_OPERAND:
-        guest_info._si_signo = POSIX_SIGFPE;
-        guest_info._si_code = POSIX_FPE_FLTSUB; // i am not sure about this one
+        signo = POSIX_SIGFPE;
+        si_code = POSIX_FPE_FLTSUB; // i am not sure about this one
         break;
     case EXCEPTION_FLT_INEXACT_RESULT:
-        guest_info._si_signo = POSIX_SIGFPE;
-        guest_info._si_code = POSIX_FPE_FLTRES;
+        signo = POSIX_SIGFPE;
+        si_code = POSIX_FPE_FLTRES;
         break;
     case EXCEPTION_FLT_STACK_CHECK:
-        guest_info._si_signo = POSIX_SIGILL;
-        guest_info._si_code = POSIX_ILL_BADSTK; // i am not sure about this one either
+        signo = POSIX_SIGILL;
+        si_code = POSIX_ILL_BADSTK; // i am not sure about this one either
         break;
     case EXCEPTION_BREAKPOINT:
     case EXCEPTION_SINGLE_STEP:
-        guest_info._si_signo = POSIX_SIGTRAP;
-        guest_info._si_code = POSIX_TRAP_BRKPT;
+        signo = POSIX_SIGTRAP;
+        si_code = POSIX_TRAP_BRKPT;
         break;
     case DBG_PRINTEXCEPTION_C:
     case DBG_PRINTEXCEPTION_WIDE_C:
@@ -131,21 +158,8 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
-    if (guest_info._si_signo != 0) {
-        if (g_curthread &&
-            g_curthread->DispatchSignal(guest_info._si_signo, &guest_info, &guest_context)) {
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-    }
-
-    const bool report_unhandled =
-        use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
-    if (report_unhandled) {
-        LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
-        Common::Singleton<Core::Emulator>::Instance()->Shutdown();
-    }
-
-    return EXCEPTION_CONTINUE_SEARCH;
+    return HandleUnclaimedException(pExp, code, address, signo, si_code,
+                                    static_protection_exception);
 }
 
 #else
