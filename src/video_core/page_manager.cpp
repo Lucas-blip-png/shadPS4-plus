@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <utility>
 #include "common/adaptive_mutex.h"
@@ -425,6 +426,7 @@ public:
 struct SignalImpl : public PageManager::Impl {
     SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
         rasterizer = rasterizer_;
+        instance = this;
 
         // Should be called first.
         constexpr auto priority = std::numeric_limits<u32>::min();
@@ -446,13 +448,61 @@ struct SignalImpl : public PageManager::Impl {
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
-        if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
-        } else {
-            return rasterizer->ReadMemory(addr, size, is_gpu_thread);
+        const bool is_write = Common::IsWriteError(context);
+        const bool handled = is_write ? rasterizer->InvalidateMemory(addr, size, is_gpu_thread)
+                                      : rasterizer->ReadMemory(addr, size, is_gpu_thread);
+        if (handled && EmulatorSettings.IsPreserveSplitProtection()) {
+            instance->RepairStaleProtection(addr, is_write);
         }
-        return false;
+        return handled;
     }
+
+    /// preserve_split_protection safety net: a fault the tracker handled must leave the page
+    /// accessible, or the faulting instruction retries forever. When the tracker's own page state
+    /// allows the access but the OS still denies it, the tracker's protection is applied again. A
+    /// denial the tracker agrees with is left alone: another thread is still releasing the page and
+    /// the retry succeeds once it is done
+    void RepairStaleProtection(VAddr addr, bool is_write) {
+#ifdef _WIN32
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(addr), &mbi, sizeof(mbi)) ||
+            mbi.State != MEM_COMMIT) {
+            return;
+        }
+        constexpr DWORD writable = PAGE_READWRITE | PAGE_EXECUTE_READWRITE;
+        constexpr DWORD readable = writable | PAGE_READONLY | PAGE_EXECUTE_READ;
+        if ((mbi.Protect & (is_write ? writable : readable)) != 0) {
+            return;
+        }
+        const VAddr page = addr & ~(PageManager::PM_PAGE_SIZE - 1);
+        const u64 page_index = page >> PageManager::PM_PAGE_BITS;
+        PageState* state = cached_pages.find(page_index);
+        auto* lock = locks.find(page_index);
+        if (!state || !lock) {
+            return;
+        }
+        Core::MemoryPermission perms;
+        {
+            std::scoped_lock lk{*lock};
+            perms = state->Perms();
+            if (!True(perms & (is_write ? Core::MemoryPermission::Write
+                                        : Core::MemoryPermission::Read))) {
+                return;
+            }
+            Protect(page, PageManager::PM_PAGE_SIZE, perms);
+        }
+        static std::atomic<u64> repairs{0};
+        if (const u64 count = repairs.fetch_add(1) + 1; count == 1 || count % 1000 == 0) {
+            LOG_WARNING(Render,
+                        "Workaround preserve_split_protection: re-applied tracker protection {} "
+                        "on {:#x} after a handled {} fault left it at OS {:#x} (#{})",
+                        static_cast<u32>(perms), page, is_write ? "write" : "read", mbi.Protect,
+                        count);
+        }
+#endif
+    }
+
+    inline static SignalImpl* instance{};
 };
 
 PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
