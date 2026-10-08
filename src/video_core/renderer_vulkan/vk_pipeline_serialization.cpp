@@ -12,12 +12,22 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
+// ShaderMetaVersion 12: meta records the codegen settings key
 static constexpr u32 ShaderBinaryVersion = 14u;
-static constexpr u32 ShaderMetaVersion = 11u;
+static constexpr u32 ShaderMetaVersion = 12u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 
 namespace Vulkan {
+
+namespace {
+/// Emulator settings that change the generated SPIR-V. The disk cache is keyed only by the guest
+/// shader hash, so a shader compiled with other values must be recompiled, not loaded
+u64 CodegenSettingsKey() {
+    return (u64{EmulatorSettings.IsWave64UniformBranches()} << 42) |
+           (u64{EmulatorSettings.IsWave64MissingLaneIdentity()} << 45);
+}
+} // namespace
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
@@ -70,6 +80,7 @@ void RegisterShaderMeta(const Shader::Info& info,
 
     meta.Write(Serialization::ShaderMetaVersion);
     meta.Write(Serialization::ShaderBinaryVersion);
+    meta.Write(CodegenSettingsKey());
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -104,6 +115,12 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     u32 binary_version{};
     meta.Read(binary_version);
     if (binary_version != Serialization::ShaderBinaryVersion) {
+        return false;
+    }
+
+    u64 codegen_key{};
+    meta.Read(codegen_key);
+    if (codegen_key != CodegenSettingsKey()) {
         return false;
     }
 
