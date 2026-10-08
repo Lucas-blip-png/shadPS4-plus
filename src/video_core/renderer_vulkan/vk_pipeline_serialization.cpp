@@ -23,9 +23,25 @@ namespace Vulkan {
 namespace {
 /// Emulator settings that change the generated SPIR-V. The disk cache is keyed only by the guest
 /// shader hash, so a shader compiled with other values must be recompiled, not loaded
+constexpr u32 LdsBarriersLargeGroupsBit = 46;
+
 u64 CodegenSettingsKey() {
-    return (u64{EmulatorSettings.IsWave64UniformBranches()} << 42) |
-           (u64{EmulatorSettings.IsWave64MissingLaneIdentity()} << 45);
+    return (u64{EmulatorSettings.IsLdsBarrierUniformReadlane()} << 33) |
+           (u64{EmulatorSettings.IsWave64UniformBranches()} << 42) |
+           (u64{EmulatorSettings.IsWave64MissingLaneIdentity()} << 45) |
+           (u64{EmulatorSettings.IsLdsBarriersLargeGroups()} << LdsBarriersLargeGroupsBit);
+}
+
+/// lds_barriers_large_groups only changes compute shaders that use LDS in workgroups larger than
+/// one GCN wave, the same condition SharedMemoryBarrierPass applies, so toggling it keeps the
+/// other cached shaders valid
+bool LdsBarriersLargeGroupsAffects(const Shader::RuntimeInfo& runtime_info) {
+    if (runtime_info.hw_stage != Shader::HwStage::Compute) {
+        return false;
+    }
+    const auto& cs = runtime_info.hw.cs;
+    return cs.shared_memory_size != 0 &&
+           cs.workgroup_size[0] * cs.workgroup_size[1] * cs.workgroup_size[2] > 64;
 }
 } // namespace
 
@@ -120,7 +136,9 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u64 codegen_key{};
     meta.Read(codegen_key);
-    if (codegen_key != CodegenSettingsKey()) {
+    const u64 key_diff = codegen_key ^ CodegenSettingsKey();
+    constexpr u64 lds_barriers_mask = u64{1} << LdsBarriersLargeGroupsBit;
+    if ((key_diff & ~lds_barriers_mask) != 0) {
         return false;
     }
 
@@ -129,6 +147,9 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(perm_idx);
 
     spec.Deserialize(ar);
+    if ((key_diff & lds_barriers_mask) != 0 && LdsBarriersLargeGroupsAffects(spec.runtime_info)) {
+        return false;
+    }
     info.Deserialize(ar);
     return true;
 }

@@ -736,6 +736,11 @@ struct GPUSettings {
     Setting<bool> wave64_uniform_branches{false};
     // Use GCN reduction identities for lanes missing from small host workgroups
     Setting<bool> wave64_missing_lane_identity{false};
+    // Treat constant-lane ReadLane as uniform so guarded LDS barriers stay in place
+    Setting<bool> lds_barrier_uniform_readlane{false};
+    // Add LDS barriers after divergent branches in compute groups larger than one GCN wave so
+    // narrower host subgroups see completed shared writes
+    Setting<bool> lds_barriers_large_groups{false};
 
 #define GPU_OVERRIDE(field) make_override<GPUSettings>(#field, &GPUSettings::field)
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -835,6 +840,8 @@ struct GPUSettings {
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
             GPU_OVERRIDE(wave64_uniform_branches),
             GPU_OVERRIDE(wave64_missing_lane_identity),
+            GPU_OVERRIDE(lds_barrier_uniform_readlane),
+            GPU_OVERRIDE(lds_barriers_large_groups),
         };
     }
 #undef GPU_OVERRIDE
@@ -869,7 +876,8 @@ struct GPUSettings {
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
     clean_sync_peek, readback_offload, real_occlusion_queries, threaded_cmd_recording, compute_fast_compile, compute_fast_compile_force, readback_transfer_queue, \
-    wave64_uniform_branches, wave64_missing_lane_identity
+    wave64_uniform_branches, wave64_missing_lane_identity, lds_barrier_uniform_readlane, \
+    lds_barriers_large_groups
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1279,6 +1287,8 @@ public:
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
     SETTING_FORWARD_BOOL(m_gpu, Wave64UniformBranches, wave64_uniform_branches)
     SETTING_FORWARD_BOOL(m_gpu, Wave64MissingLaneIdentity, wave64_missing_lane_identity)
+    SETTING_FORWARD_BOOL(m_gpu, LdsBarrierUniformReadlane, lds_barrier_uniform_readlane)
+    SETTING_FORWARD_BOOL(m_gpu, LdsBarriersLargeGroups, lds_barriers_large_groups)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {
