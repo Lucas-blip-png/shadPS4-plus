@@ -670,7 +670,12 @@ void Instance::CreateAllocator() {
     };
 
     const VmaAllocatorCreateInfo allocator_info = {
-        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+        // The driver's budget counts the arena memory allocated outside VMA, so once VRAM is full
+        // images go to system memory instead of the VRAM arena_reserve_mb set aside
+        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
+                 (supports_memory_budget && EmulatorSettings.GetArenaReserveMb() != 0
+                      ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT
+                      : 0u),
         .physicalDevice = physical_device,
         .device = *device,
         .pVulkanFunctions = &functions,
