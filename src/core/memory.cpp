@@ -315,6 +315,7 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     // The shared lock held for this function, or the outer scope's, keeps the map and therefore
     // this iterator stable.
     const u64 total = size;
+    const u8* src = static_cast<const u8*>(data);
     auto vma_it = FindVMA(virtual_addr);
     if (!vma_it->second.Overlaps(virtual_addr, total) || !HasPhysicalBacking(vma_it->second)) {
         return false;
@@ -347,7 +348,8 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                     ++memo.multi;
                 }
             }
-            memcpy(backing, data, copy_size);
+            memcpy(backing, src, copy_size);
+            src += copy_size;
             size -= copy_size;
         }
         ++vma_it;
