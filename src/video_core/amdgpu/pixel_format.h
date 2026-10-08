@@ -100,6 +100,12 @@ enum class CompSwizzle : u8 {
     Alpha = 7,
 };
 
+/// Selectors 2 and 3 are reserved and already read as zero in the shader swizzle; use the same
+/// zero in resource keys, cache keys and Vulkan swizzles so they all describe the same channels.
+constexpr CompSwizzle NormalizeCompSwizzle(CompSwizzle swizzle) {
+    return swizzle == CompSwizzle(2) || swizzle == CompSwizzle(3) ? CompSwizzle::Zero : swizzle;
+}
+
 enum class NumberConversion : u32 {
     None = 0,
     UintToUscaled = 1,
@@ -122,6 +128,15 @@ union CompMapping {
 
     bool operator==(const CompMapping& other) const {
         return array == other.array;
+    }
+
+    [[nodiscard]] constexpr CompMapping Normalized() const {
+        return {
+            .r = NormalizeCompSwizzle(r),
+            .g = NormalizeCompSwizzle(g),
+            .b = NormalizeCompSwizzle(b),
+            .a = NormalizeCompSwizzle(a),
+        };
     }
 
     template <typename T>
@@ -160,7 +175,7 @@ union CompMapping {
 private:
     template <typename T>
     T ApplySingle(const std::array<T, 4>& data, const CompSwizzle swizzle) const {
-        switch (swizzle) {
+        switch (NormalizeCompSwizzle(swizzle)) {
         case CompSwizzle::Zero:
             return T(0);
         case CompSwizzle::One:
