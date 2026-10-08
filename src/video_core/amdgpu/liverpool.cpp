@@ -1141,7 +1141,12 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             break;
         }
         case PM4ItOpcode::GetLodStats: {
-            LOG_WARNING(Render_Vulkan, "Unimplemented IT_GET_LOD_STATS");
+            const auto* lod_stats = reinterpret_cast<const PM4CmdGetLodStats*>(header);
+            if (!rasterizer ||
+                !rasterizer->WriteLodStats(lod_stats->Address(), lod_stats->NumBytes())) {
+                // Some titles emit it every frame.
+                LOG_DEBUG(Render_Vulkan, "IT_GET_LOD_STATS ignored");
+            }
             break;
         }
         case PM4ItOpcode::CondExec: {
@@ -1515,6 +1520,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::EventWrite: {
             // const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+            break;
+        }
+        case PM4ItOpcode::GetLodStats: {
+            const auto* lod_stats = reinterpret_cast<const PM4CmdGetLodStats*>(header);
+            if (!rasterizer ||
+                !rasterizer->WriteLodStats(lod_stats->Address(), lod_stats->NumBytes())) {
+                LOG_DEBUG(Render_Vulkan, "IT_GET_LOD_STATS ignored (ASC)");
+            }
             break;
         }
         default:

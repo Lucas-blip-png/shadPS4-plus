@@ -78,6 +78,9 @@ public:
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
+    /// lod_stats_from_bindings: answers IT_GET_LOD_STATS from the counter banks of the T#s bound
+    /// since the previous packet. Returns false when the setting is off.
+    bool WriteLodStats(VAddr address, u32 num_bytes);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool TryCpWriteBacking(VAddr addr, const void* data, u64 size);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
@@ -451,6 +454,11 @@ private:
     PipelineCache pipeline_cache;
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
+    // lod_stats_from_bindings: bindings per T# counter_bank_id since the last IT_GET_LOD_STATS.
+    // Only the GPU command processor thread binds textures and parses the packet.
+    const bool lod_stats_enabled;
+    bool lod_stats_reported{};
+    std::array<u32, 256> lod_stats_uses{};
 
     struct ImageBinding {
         VideoCore::ImageId image_id;

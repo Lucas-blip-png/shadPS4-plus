@@ -94,7 +94,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       liverpool{liverpool_}, memory{Core::Memory::Instance()},
       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
-      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
+      lod_stats_enabled{EmulatorSettings.IsLodStatsFromBindings()} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -2228,6 +2229,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
         }
 
+        // Read from the live T# on every draw, ahead of the image memo and the
+        // bind plan, which only skip the lookup and the descriptor work.
+        if (lod_stats_enabled && tsharp.lod_hw_cnt_en) [[unlikely]] {
+            u32& uses = lod_stats_uses[tsharp.counter_bank_id];
+            uses += uses < 0xFFFFFFu;
+        }
+
         for (u32 i = 0; i < num_bindings; i++) {
             // Mip fallback rewrites the view range before the memo probe, so
             // only fallback-free bindings defer the view build to a memo miss.
@@ -3051,6 +3059,39 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     u32 value;
     std::memcpy(&value, gds_buf->mapped_data.data() + gds_offset, sizeof(u32));
     return value;
+}
+
+bool Rasterizer::WriteLodStats(VAddr address, u32 num_bytes) {
+    if (!lod_stats_enabled) {
+        return false;
+    }
+    // Hardware reports the sample count below min_lod_warn in bits 32..55 and the finest LOD
+    // requested in bits 56..59 (15 = not sampled). Those LODs are not visible here, so each bank
+    // bound since the last packet reports LOD 0 with its binding count. The 64-byte header is
+    // left intact and entry i maps to bank i % 256.
+    constexpr u32 HeaderBytes = 0x40;
+    constexpr u32 MaxBytes = 16u << 20;
+    constexpr u64 NotSampled = u64{0xF} << 56;
+    if (num_bytes <= HeaderBytes || num_bytes > MaxBytes || !IsMapped(address, num_bytes)) {
+        LOG_WARNING(Render_Vulkan, "IT_GET_LOD_STATS with invalid buffer {:#x}+{:#x}, ignored",
+                    address, num_bytes);
+        return true;
+    }
+    const u32 num_entries = (num_bytes - HeaderBytes) / sizeof(u64);
+    // A CP write lands at parse time; earlier draws' reads may still sit on the copy lanes.
+    VideoCore::StreamCopyLane::Instance().DrainProducer();
+    auto* entries = reinterpret_cast<u64*>(address + HeaderBytes);
+    for (u32 i = 0; i < num_entries; ++i) {
+        const u32 uses = lod_stats_uses[i % lod_stats_uses.size()];
+        entries[i] = uses != 0 ? u64{uses} << 32 : NotSampled;
+    }
+    lod_stats_uses.fill(0);
+    if (!lod_stats_reported) {
+        lod_stats_reported = true;
+        LOG_WARNING(Render_Vulkan, "lod_stats_from_bindings: answering IT_GET_LOD_STATS at {:#x}",
+                    address);
+    }
+    return true;
 }
 
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
