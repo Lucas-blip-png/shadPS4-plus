@@ -286,12 +286,16 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
                                  vk::AccessFlagBits2::eMemoryWrite;
     if (needs_partial_transition && !partially_transited && last_state.layout == dst_layout &&
         last_state.access_mask == dst_mask && !(last_state.access_mask & write_flags)) {
+        last_state.pl_stage |= dst_stage;
         RecordNoopBarrier(dst_layout, dst_mask, dst_stage, subres_range);
         return;
     }
     // The inline GetBarriers has already probed BarriersNoop; the collapse
     // above only bumps state_epoch.
     const bool had_subres = !subresource_states.empty();
+    // Stages of subresources read again without a barrier: the next write must
+    // wait for every earlier reader, not only the last one.
+    vk::PipelineStageFlags2 reader_stages{};
 
     if (needs_partial_transition || partially_transited) {
         if (!partially_transited) {
@@ -350,9 +354,13 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
                     state.layout = dst_layout;
                     state.access_mask = dst_mask;
                     state.pl_stage = dst_stage;
+                } else {
+                    state.pl_stage |= dst_stage;
+                    reader_stages |= state.pl_stage;
                 }
             }
         }
+        backing->subres_stage_union |= reader_stages;
 
         if (barriers.size() != num_barriers_in) {
             backing->subres_stage_union |= dst_stage;
@@ -370,6 +378,7 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
     } else { // Full resource transition
         const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
         if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
+            last_state.pl_stage |= dst_stage;
             RecordNoopBarrier(dst_layout, dst_mask, dst_stage, subres_range);
             return;
         }
@@ -399,8 +408,9 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
         RecordNoopBarrier(dst_layout, dst_mask, dst_stage, subres_range);
         return;
     }
+    const vk::PipelineStageFlags2 new_stage = dst_stage | reader_stages;
     if (last_state.layout != dst_layout || last_state.access_mask != dst_mask ||
-        last_state.pl_stage != dst_stage) {
+        last_state.pl_stage != new_stage) {
         BumpStateEpoch();
     }
     // subres_divergent is counted against last_state; a partial transition
@@ -416,7 +426,7 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
     last_state.layout = dst_layout;
     last_state.access_mask = dst_mask;
     Skipcache::Framework::Instance().BumpLayoutGen();
-    last_state.pl_stage = dst_stage;
+    last_state.pl_stage = new_stage;
 }
 
 } // namespace VideoCore
