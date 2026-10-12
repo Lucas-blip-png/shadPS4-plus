@@ -2392,7 +2392,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     .info_index = static_cast<u32>(image_infos.size() - 1),
                     .image_id = image_id,
                     .backing_index = static_cast<u32>(image.backing - image.backing_images.data()),
-                    .subres_idx = range.base.level * image.info.resources.layers + range.base.layer,
+                    .subres_idx = static_cast<u32>(range.base.level * image.info.resources.layers +
+                                                   range.base.layer),
                 });
             }
         }
