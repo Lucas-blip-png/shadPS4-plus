@@ -542,6 +542,10 @@ struct GPUSettings {
     // SotC BPE heap address (0 = off): readbacks keep the heap allocator metadata of the CPU.
     // Moves with extra_dmem_in_mbytes; on US 1.00 it is 0x33160fd20 plus the extra memory.
     Setting<u64> bpe_heap_guard_address{0};
+    // Answer IT_GET_LOD_STATS by reporting the counter banks of the T#s bound since the previous
+    // packet as sampled at LOD 0, so titles that stream mips from those counters (Shadow of the
+    // Colossus) request finer ones. Off leaves the packet ignored.
+    Setting<bool> lod_stats_from_bindings{false};
     // Flush the graphics command buffer every this many draws (0 = only at
     // submit-done and faults). A guest readback then waits on a command
     // buffer holding at most this many draws instead of the whole recorded
@@ -803,6 +807,7 @@ struct GPUSettings {
             GPU_OVERRIDE(readback_transfer_queue),
             GPU_OVERRIDE(cpu_authoritative_stacks),
             GPU_OVERRIDE(bpe_heap_guard_address),
+            GPU_OVERRIDE(lod_stats_from_bindings),
             GPU_OVERRIDE(flush_draw_interval),
             GPU_OVERRIDE(pipeline_key_stamp_reuse),
             GPU_OVERRIDE(shader_params_memo),
@@ -900,7 +905,8 @@ struct GPUSettings {
     wave64_uniform_branches, wave64_missing_lane_identity, lds_barrier_uniform_readlane, \
     lds_barriers_large_groups, compute_loop_cap, early_fragment_tests_from_z_order, \
     dynamic_tsharp_array_size, \
-    preserve_split_protection
+    preserve_split_protection, \
+    lod_stats_from_bindings
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1243,6 +1249,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ReadbackTransferQueue, readback_transfer_queue)
     SETTING_FORWARD_BOOL(m_gpu, CpuAuthoritativeStacks, cpu_authoritative_stacks)
     SETTING_FORWARD(m_gpu, BpeHeapGuardAddress, bpe_heap_guard_address)
+    SETTING_FORWARD_BOOL(m_gpu, LodStatsFromBindings, lod_stats_from_bindings)
     SETTING_FORWARD(m_gpu, FlushDrawInterval, flush_draw_interval)
     SETTING_FORWARD_BOOL(m_gpu, PipelineKeyStampReuse, pipeline_key_stamp_reuse)
     SETTING_FORWARD_BOOL(m_gpu, ShaderParamsMemo, shader_params_memo)
