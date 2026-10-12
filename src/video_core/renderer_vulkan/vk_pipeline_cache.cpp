@@ -1861,7 +1861,7 @@ u64 PipelineCache::CreateProgramSlow(HwStage stage, SwStage l_stage,
         CompileModule(created_slot->info, ri_compile, params.code, perm_idx, binding);
     NoteSharpVerdicts(created_slot->info);
     auto spec = Shader::StageSpecialization(created_slot->info, ri_compile, profile, start);
-    const auto perm_hash = HashCombine(params.hash, perm_idx);
+    const auto perm_hash = HashCombine(params.hash, u64{perm_idx});
 
     if (spec_fp_cache) {
         spec.ComputeSig();
