@@ -309,6 +309,15 @@ public:
     static void EndBackingPush();
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
+
+    /// Reads guest memory through its physical backing, bypassing page protection. Returns false
+    /// when part of the range is unmapped or has no physical backing.
+    bool TryReadBacking(VAddr virtual_addr, void* out, u64 size);
+
+    /// Returns the physical run containing virtual_addr, with its guest start and size, or nullptr
+    /// if absent. With try_lock, also returns nullptr when a writer holds the lock.
+    const u8* GetBackingRun(VAddr virtual_addr, VAddr* run_start, u64* run_size,
+                            bool try_lock = false);
     struct BackingWriteStats {
         u64 calls;
         u64 hits;
