@@ -3080,6 +3080,12 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     return true;
 }
 
+void Rasterizer::ReleaseCpuAuthoritativeRange(VAddr addr, u64 size) {
+    if (IsMapped(addr, size)) {
+        buffer_cache.ReleaseCpuAuthoritativeRange(addr, size);
+    }
+}
+
 // Async-signal-safe per-thread cache of positive IsMapped intervals; no lock on the
 // fast path. Map/Unmap bump the generation (release), an acquire load drops stale hits.
 bool Rasterizer::IsMapped(VAddr addr, u64 size) {

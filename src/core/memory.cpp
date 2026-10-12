@@ -315,6 +315,7 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     // The shared lock held for this function, or the outer scope's, keeps the map and therefore
     // this iterator stable.
     const u64 total = size;
+    const u8* src = static_cast<const u8*>(data);
     auto vma_it = FindVMA(virtual_addr);
     if (!vma_it->second.Overlaps(virtual_addr, total) || !HasPhysicalBacking(vma_it->second)) {
         return false;
@@ -347,7 +348,8 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                     ++memo.multi;
                 }
             }
-            memcpy(backing, data, copy_size);
+            memcpy(backing, src, copy_size);
+            src += copy_size;
             size -= copy_size;
         }
         ++vma_it;
@@ -355,6 +357,62 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
              HasPhysicalBacking(vma_it->second));
 
     return true;
+}
+
+bool MemoryManager::TryReadBacking(VAddr virtual_addr, void* out, u64 size) {
+    std::shared_lock lk{mutex};
+    if (!IsValidMapping(virtual_addr, size)) {
+        return false;
+    }
+    u8* dst = static_cast<u8*>(out);
+    auto vma = FindVMA(virtual_addr);
+    while (size) {
+        if (vma == vma_map.end() || !vma->second.Overlaps(virtual_addr, size) ||
+            !HasPhysicalBacking(vma->second)) {
+            return false;
+        }
+        const u64 start_in_vma = virtual_addr - vma->second.base;
+        auto phys = std::prev(vma->second.phys_areas.upper_bound(start_in_vma));
+        const u64 start_in_phys = start_in_vma - phys->first;
+        if (start_in_phys >= phys->second.size) {
+            return false;
+        }
+        const u64 copy_size = std::min<u64>(size, phys->second.size - start_in_phys);
+        std::memcpy(dst, impl.BackingBase() + phys->second.base + start_in_phys, copy_size);
+        dst += copy_size;
+        virtual_addr += copy_size;
+        size -= copy_size;
+        if (virtual_addr >= vma->second.base + vma->second.size) {
+            ++vma;
+        }
+    }
+    return true;
+}
+
+const u8* MemoryManager::GetBackingRun(VAddr virtual_addr, VAddr* run_start, u64* run_size,
+                                       bool try_lock) {
+    std::shared_lock lk{mutex, std::defer_lock};
+    if (!try_lock) {
+        lk.lock();
+    } else if (!lk.try_lock()) {
+        return nullptr;
+    }
+    if (!IsValidMapping(virtual_addr, 1)) {
+        return nullptr;
+    }
+    const auto vma = FindVMA(virtual_addr);
+    if (vma == vma_map.end() || !vma->second.Overlaps(virtual_addr, 1) ||
+        !HasPhysicalBacking(vma->second)) {
+        return nullptr;
+    }
+    const u64 start_in_vma = virtual_addr - vma->second.base;
+    const auto phys = std::prev(vma->second.phys_areas.upper_bound(start_in_vma));
+    if (start_in_vma - phys->first >= phys->second.size) {
+        return nullptr;
+    }
+    *run_start = vma->second.base + phys->first;
+    *run_size = std::min<u64>(phys->second.size, vma->second.size - phys->first);
+    return impl.BackingBase() + phys->second.base;
 }
 
 MemoryManager::BackingWriteStats MemoryManager::DrainBackingWriteStats() {
@@ -1850,6 +1908,45 @@ MemoryManager::PhysHandle MemoryManager::Split(PhysMap& map, PhysHandle phys_han
     new_area.size -= offset_in_area;
 
     return map.emplace_hint(std::next(phys_handle), new_area.base, new_area);
+}
+
+// Host page protection is page granular, so a stack that is not page aligned (fiber contexts are
+// carved out of the heap) must exclude the whole pages it touches
+static constexpr u64 StackPageSize = 4_KB;
+
+void MemoryManager::RegisterStackRange(VAddr virtual_addr, u64 size) {
+    if (size == 0 || !EmulatorSettings.IsCpuAuthoritativeStacks()) {
+        return;
+    }
+    const VAddr start = Common::AlignDown(virtual_addr, StackPageSize);
+    const VAddr end = Common::AlignUp(virtual_addr + size, StackPageSize);
+    stack_ranges.Add(start, end);
+    // The range may already be write-protected by GPU memory tracking (e.g. a fiber context carved
+    // out of a heap that the GPU also reads). Restore write access right away: tracking faults can
+    // never be delivered on a read-only stack page
+    std::shared_lock lk{mutex};
+    if (IsValidMapping(start, end - start)) {
+        impl.Protect(start, end - start, MemoryPermission::ReadWrite);
+    }
+}
+
+void MemoryManager::UnregisterStackRange(VAddr virtual_addr, u64 size) {
+    if (size == 0 || !stack_ranges.HasRanges()) {
+        return;
+    }
+    // Same page rounding as RegisterStackRange: the counts keep pages shared with another live
+    // stack excluded
+    const VAddr start = Common::AlignDown(virtual_addr, StackPageSize);
+    const VAddr end = Common::AlignUp(virtual_addr + size, StackPageSize);
+    stack_ranges.Remove(start, end);
+    // The game reuses the memory (e.g. as allocator metadata of a fiber heap). Hand the parts that
+    // are no longer any stack back to normal tracking as CPU-modified, so no stale GPU data is ever
+    // downloaded over them
+    if (rasterizer) {
+        for (const auto& [lo, len] : SubtractStackRanges(start, end - start)) {
+            rasterizer->ReleaseCpuAuthoritativeRange(lo, len);
+        }
+    }
 }
 
 } // namespace Core

@@ -81,6 +81,7 @@ public:
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool TryCpWriteBacking(VAddr addr, const void* data, u64 size);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+    void ReleaseCpuAuthoritativeRange(VAddr addr, u64 size);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);

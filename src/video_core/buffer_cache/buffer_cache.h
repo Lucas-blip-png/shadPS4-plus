@@ -83,6 +83,9 @@ public:
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
 
+    /// Hands a range that stopped being a guest stack back to tracking as CPU modified.
+    void ReleaseCpuAuthoritativeRange(VAddr device_addr, u64 size);
+
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
@@ -143,6 +146,10 @@ private:
     /// Moves the GPU modified ranges of a span out of gpu_modified_ranges into copies from the
     /// arena, packed from offset 0. Returns the packed size.
     u64 CollectDownloads(const Buffer* arena, VAddr device_addr, u64 size, DownloadCopies& copies);
+
+    /// Writes downloaded copies to guest memory. Every GPU readback of the arena ends here.
+    void WriteBackDownloads(VAddr arena_base, const DownloadCopies& copies, const u8* mapped,
+                            u64 staging_offset);
 
     /// Downloads a request inside one readback window while the GPU thread keeps running.
     /// Returns false when the request has to take the synchronous download.

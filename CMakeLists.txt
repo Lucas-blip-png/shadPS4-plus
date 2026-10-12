@@ -1023,6 +1023,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/platform.h
          src/core/signals.cpp
          src/core/signals.h
+         src/core/stack_ranges.cpp
+         src/core/stack_ranges.h
          src/core/thread.cpp
          src/core/thread.h
          src/core/tls.cpp
@@ -1185,6 +1187,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/amdgpu/tiling.h
                src/video_core/buffer_cache/buffer.cpp
                src/video_core/buffer_cache/buffer.h
+               src/video_core/buffer_cache/bpe_heap_guard.cpp
+               src/video_core/buffer_cache/bpe_heap_guard.h
                src/video_core/buffer_cache/buffer_cache.cpp
                src/video_core/buffer_cache/buffer_cache.h
                src/video_core/buffer_cache/fault_manager.cpp

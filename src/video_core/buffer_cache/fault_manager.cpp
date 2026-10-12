@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/div_ceil.h"
+#include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -167,7 +168,13 @@ void FaultManager::ProcessFaultBuffer() {
         fault_ranges.Clear();
         const u64* fault_buf = std::bit_cast<const u64*>(mapped);
         const u32 fault_count = fault_buf[0];
+        auto* memory = Core::Memory::Instance();
         for (u32 i = 1; i <= fault_count; ++i) {
+            // Shaders reading through bogus pointers can touch guest stacks; those pages must not
+            // become tracked GPU buffers
+            if (memory->OverlapsStackRange(fault_buf[i], sparse_pagesize)) {
+                continue;
+            }
             fault_ranges.Add(fault_buf[i], sparse_pagesize);
             LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_buf[i]);
         }

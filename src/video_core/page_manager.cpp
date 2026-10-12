@@ -438,7 +438,16 @@ struct SignalImpl : public PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
-        impl.Protect(address, size, perms);
+        // Leave guest stack pages writable (cpu_authoritative_stacks); the OS cannot dispatch a
+        // fault raised while pushing to a protected stack page, so skip tracking there
+        if (True(perms & Core::MemoryPermission::Write) ||
+            !memory->OverlapsStackRange(address, size)) {
+            impl.Protect(address, size, perms);
+            return;
+        }
+        for (const auto& [sub_address, sub_size] : memory->SubtractStackRanges(address, size)) {
+            impl.Protect(sub_address, sub_size, perms);
+        }
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
