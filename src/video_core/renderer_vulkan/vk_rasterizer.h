@@ -160,6 +160,8 @@ private:
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    /// dynamic_tsharp_array_size: logs the first descriptor array bound, then a per-minute count
+    void ReportTsharpArray(u64 pgm_hash, u32 num_elements, u32 null_elements);
     bool BindResources(const Pipeline* pipeline);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
@@ -459,7 +461,11 @@ private:
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     ImageBinding db_desc;
 
-    boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
+    // Room for dynamic_tsharp_array_size descriptor arrays (array_size + 1 bindings each; the recompiler
+    // keeps a shader's arrays within NUM_IMAGE_ARRAY_DESCRIPTORS)
+    static constexpr u32 MaxImageDescriptors =
+        Shader::NUM_IMAGES + Shader::NUM_IMAGE_ARRAY_DESCRIPTORS;
+    boost::container::static_vector<vk::DescriptorImageInfo, MaxImageDescriptors> image_infos;
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;
         u64 offset;
@@ -486,7 +492,7 @@ private:
     // Objects built once; PrimeNext hands out the next one untouched for an
     // in-place prime, emplace_back rebuilds one with construct_at.
     struct ImageBindingList {
-        std::array<ImageBinding, Shader::NUM_IMAGES> slots{};
+        std::array<ImageBinding, MaxImageDescriptors> slots{};
         u32 n{};
         void clear() noexcept {
             n = 0;
@@ -585,6 +591,10 @@ private:
     u64 glue_arms_{};
     u64 glue_div_{};
     bool needs_barrier{};
+    // dynamic_tsharp_array_size: descriptor arrays bound and their null elements
+    u64 tsharp_array_binds_minute{};
+    u64 tsharp_array_null_minute{};
+    std::chrono::steady_clock::time_point tsharp_array_last_report{};
 };
 
 } // namespace Vulkan

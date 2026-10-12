@@ -43,6 +43,7 @@ struct InfoPersistent {
     ImageResourceList images;
     SamplerResourceList samplers;
     FMaskResourceList fmasks;
+    SharpTableList sharp_tables;
 
     u32 fetch_shader_sgpr_base{};
     u32 shared_memory_scratch_size{};
@@ -170,19 +171,40 @@ struct Info : InfoPersistent {
     void AddBindings(Backend::Bindings& bnd) const {
         bnd.buffer += buffers.size();
         bnd.unified += buffers.size() + images.size() + samplers.size();
+        for (const auto& image : images) {
+            // Descriptor arrays take array_size + 1 bindings
+            bnd.unified += image.array_size;
+        }
     }
 
     void RefreshFlatBuf() {
-        // The walker's first destination dword is NUM_USER_DATA_REGS, so with no walker the flat
-        // buffer is the 16 user-data registers unchanged.
-        if (!srt_info.walker_func) {
+        // The walker's first destination dword is NUM_USER_DATA_REGS, so with no walker and no
+        // sharp table the flat buffer is the 16 user-data registers unchanged.
+        if (!srt_info.walker_func && sharp_tables.empty()) {
             flat_ud = user_data.data();
             return;
         }
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), NUM_USER_DATA_REGS * sizeof(u32));
-        srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+        if (srt_info.walker_func) {
+            srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+        }
         flat_ud = flattened_ud_buf.data();
+        if (!sharp_tables.empty()) {
+            RefreshSharpTables();
+        }
+    }
+
+    /// Copies every SharpTable from guest memory into the flat buffer (zeros if unmapped)
+    void RefreshSharpTables();
+
+    /// Flat buffer dwords that hold sharp tables rather than SRT walker output
+    u32 SharpTableDwords() const noexcept {
+        u32 dwords = 0;
+        for (const auto& table : sharp_tables) {
+            dwords += table.NumDwords();
+        }
+        return dwords;
     }
 
     // Derives every descriptor's in-place read verdict. Runs once per Info: after
@@ -213,5 +235,8 @@ struct Info : InfoPersistent {
     bool Deserialize(Serialization::Archive& ar);
 };
 DECLARE_ENUM_FLAG_OPERATORS(Info::ReadConstType);
+
+/// Per-game dynamic_tsharp_array_size, clamped to 64 elements (0 = off)
+u32 DynamicTsharpArraySize();
 
 } // namespace Shader

@@ -12,9 +12,11 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-// ShaderMetaVersion 12: meta records the codegen settings key; InfoPersistent gains uses_loop_cap
+// ShaderMetaVersion 12: meta records the codegen settings key. ShaderMetaVersion 13: InfoPersistent gains
+// uses_loop_cap and sharp_tables, ImageResource the descriptor array fields, HwFragmentRuntimeInfo
+// early_fragment_tests (all stored raw)
 static constexpr u32 ShaderBinaryVersion = 14u;
-static constexpr u32 ShaderMetaVersion = 12u;
+static constexpr u32 ShaderMetaVersion = 13u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 
@@ -29,6 +31,7 @@ u64 CodegenSettingsKey() {
     return u64{EmulatorSettings.GetComputeLoopCap()} |
            (u64{EmulatorSettings.IsLdsBarrierUniformReadlane()} << 33) |
            (u64{EmulatorSettings.IsEarlyFragmentTestsFromZOrder()} << 34) |
+           (u64{Shader::DynamicTsharpArraySize()} << 35) | // 7 bits, at most 64
            (u64{EmulatorSettings.IsWave64UniformBranches()} << 42) |
            (u64{EmulatorSettings.IsWave64MissingLaneIdentity()} << 45) |
            (u64{EmulatorSettings.IsLdsBarriersLargeGroups()} << LdsBarriersLargeGroupsBit);

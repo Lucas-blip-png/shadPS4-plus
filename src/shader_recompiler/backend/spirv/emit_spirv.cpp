@@ -67,6 +67,11 @@ ArgType Arg(EmitContext& ctx, const IR::Value& arg) {
     } else if constexpr (std::is_same_v<ArgType, const IR::Value&>) {
         return arg;
     } else if constexpr (std::is_same_v<ArgType, u32>) {
+        if (const IR::Inst* handle = arg.TryInst();
+            handle && handle->GetOpcode() == IR::Opcode::ImageArrayHandle) {
+            // Descriptor array image: the instruction indexes the array itself (LoadImage)
+            return handle->Arg(0).U32();
+        }
         return arg.U32();
     } else if constexpr (std::is_same_v<ArgType, u64>) {
         return arg.U64();

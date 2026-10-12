@@ -308,6 +308,8 @@ public:
         bool is_integer = false;
         bool is_storage = false;
         MipStorageFallbackMode mip_fallback_mode{};
+        /// Descriptor array size (0 = single image), see ImageResource::array_size
+        u32 array_size{};
     };
 
     enum class PointerType : u32 {
