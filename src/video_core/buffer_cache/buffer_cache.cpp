@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <optional>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -11,6 +16,7 @@
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/buffer_cache/bpe_heap_guard.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
@@ -156,6 +162,31 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
 }
 
+static void ReportHeapGuardHit(VAddr addr, u64 bytes) {
+    // Write-backs run on the GPU thread and, with readback_offload, on the readback finisher
+    static std::mutex report_mutex;
+    static u64 hits = 0;
+    static u64 total = 0;
+    static auto last_report = std::chrono::steady_clock::now();
+    std::scoped_lock lk{report_mutex};
+    ++hits;
+    total += bytes;
+    const auto now = std::chrono::steady_clock::now();
+    if (hits == 1) {
+        LOG_WARNING(Render,
+                    "Workaround bpe_heap_guard: kept CPU heap metadata under a readback at {:#x} "
+                    "({:#x} differing bytes)",
+                    addr, bytes);
+        last_report = now;
+    } else if (now - last_report >= std::chrono::minutes{1}) {
+        LOG_WARNING(Render,
+                    "Workaround bpe_heap_guard: {} readbacks kept heap metadata so far ({:#x} "
+                    "bytes), last at {:#x}",
+                    hits, total, addr);
+        last_report = now;
+    }
+}
+
 u64 BufferCache::CollectDownloads(const Buffer* arena, VAddr device_addr, u64 size,
                                   DownloadCopies& copies) {
     u64 total_size_bytes = 0;
@@ -187,11 +218,52 @@ u64 BufferCache::CollectDownloads(const Buffer* arena, VAddr device_addr, u64 si
 
 void BufferCache::WriteBackDownloads(VAddr arena_base, const DownloadCopies& copies,
                                      const u8* mapped, u64 staging_offset) {
+    // bpe_heap_guard: GPU output of dispatches running on stale descriptors must not overwrite the
+    // allocator metadata of the game's heap (SotC AVs at eboot+0x48xxx). Building the guard walks
+    // the whole free tree, so it is built only when the write-back reaches the heap, whose base and
+    // size the heap object keeps at +0x28 and +0x30.
+    std::optional<BpeHeapGuard> heap_guard;
+    if (const u64 heap = EmulatorSettings.GetBpeHeapGuardAddress(); heap != 0) {
+        bool reaches = true;
+        std::array<u64, 2> span{};
+        if (memory->TryReadBacking(heap + 0x28, span.data(), sizeof(span)) &&
+            span[1] >= 0x1000000 && span[1] <= 0x100000000) {
+            constexpr u64 Margin = 1_MB;
+            VAddr lo = ~VAddr{0};
+            VAddr hi = 0;
+            for (const auto& copy : copies) {
+                lo = std::min<VAddr>(lo, arena_base + copy.srcOffset);
+                hi = std::max<VAddr>(hi, arena_base + copy.srcOffset + copy.size);
+            }
+            reaches = lo < span[0] + span[1] + Margin && span[0] < hi + Margin;
+        }
+        if (reaches) {
+            heap_guard.emplace(memory, heap);
+            if (!heap_guard->IsValid()) {
+                // The heap object moves with extra_dmem_in_mbytes on SotC US 1.00 (0x33160fd20
+                // plus the extra memory); an invalid address leaves the metadata unprotected
+                static std::atomic_flag warned;
+                if (!warned.test_and_set()) {
+                    LOG_WARNING(Render,
+                                "bpe_heap_guard_address {:#x} does not hold the heap, guard off",
+                                heap);
+                }
+                heap_guard.reset();
+            }
+        }
+    }
     for (const auto& copy : copies) {
         const VAddr copy_addr = arena_base + copy.srcOffset;
         const u8* src = mapped + (copy.dstOffset - staging_offset);
         // A page can become a stack while the GPU drains: subtract the stacks again
         for (const auto& [lo, len] : memory->SubtractStackRanges(copy_addr, copy.size)) {
+            if (heap_guard) {
+                if (const u64 kept = heap_guard->Write(lo, src + (lo - copy_addr), len);
+                    kept != 0) {
+                    ReportHeapGuardHit(lo, kept);
+                }
+                continue;
+            }
             memory->TryWriteBacking(std::bit_cast<u8*>(lo), src + (lo - copy_addr), len);
         }
     }
