@@ -903,14 +903,15 @@ struct GPUSettings {
     runtime_info_stamp_gate, userfaultfd, gpu_thread_core_reserve, one_thread_per_core, \
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
-    clean_sync_peek, readback_offload, real_occlusion_queries, threaded_cmd_recording, compute_fast_compile, compute_fast_compile_force, readback_transfer_queue, \
+    clean_sync_peek, readback_offload, real_occlusion_queries, threaded_cmd_recording, compute_fast_compile, compute_fast_compile_force, readback_transfer_queue
+#define GPU_SETTINGS_JSON_FIELDS_C \
     cpu_authoritative_stacks, bpe_heap_guard_address, \
     wave64_uniform_branches, wave64_missing_lane_identity, lds_barrier_uniform_readlane, \
     lds_barriers_large_groups, compute_loop_cap, early_fragment_tests_from_z_order, \
     dynamic_tsharp_array_size, \
     preserve_split_protection, \
     lod_stats_from_bindings, \
-    clean_sync_peek, arena_reserve_mb, readback_offload, real_occlusion_queries, threaded_cmd_recording, compute_fast_compile, compute_fast_compile_force, readback_transfer_queue
+    arena_reserve_mb
 // clang-format on
 template <
     typename BasicJsonType,
@@ -918,6 +919,7 @@ template <
 void to_json(BasicJsonType& nlohmann_json_j, const GPUSettings& nlohmann_json_t) {
     NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, GPU_SETTINGS_JSON_FIELDS_A))
     NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, GPU_SETTINGS_JSON_FIELDS_B))
+    NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, GPU_SETTINGS_JSON_FIELDS_C))
 }
 template <
     typename BasicJsonType,
@@ -925,6 +927,7 @@ template <
 void from_json(const BasicJsonType& nlohmann_json_j, GPUSettings& nlohmann_json_t) {
     NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_FROM, GPU_SETTINGS_JSON_FIELDS_A))
     NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_FROM, GPU_SETTINGS_JSON_FIELDS_B))
+    NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_FROM, GPU_SETTINGS_JSON_FIELDS_C))
 }
 
 // -------------------------------
