@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <magic_enum/magic_enum.hpp>
@@ -355,9 +357,45 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         copy.dstOffset += download.offset;
     }
     runtime.CopyBuffer(arena, download.buffer, copies);
+    static const bool dl_stats = std::getenv("SHADPS4_DL_STATS") != nullptr;
+    const auto dl_t0 = std::chrono::steady_clock::now();
     scheduler.Finish();
+    const auto dl_t1 = std::chrono::steady_clock::now();
 
     download.buffer->Invalidate(download.offset, download.size);
+    if (dl_stats) {
+        static u64 calls = 0, bytes = 0, diff = 0, finish_us = 0, windows = 0;
+        static VAddr last_window = 0;
+        static auto last_report = dl_t1;
+        u64 changed = 0;
+        for (const auto& copy : copies) {
+            std::vector<u64> old_data(copy.size / 8);
+            if (!memory->TryReadBacking(arena_base + copy.srcOffset, old_data.data(),
+                                        old_data.size() * 8)) {
+                continue;
+            }
+            const auto* new_data =
+                std::bit_cast<const u64*>(download.mapped + (copy.dstOffset - download.offset));
+            for (u64 i = 0; i < old_data.size(); ++i) {
+                changed += old_data[i] != new_data[i] ? 8 : 0;
+            }
+            bytes += copy.size;
+        }
+        diff += changed;
+        ++calls;
+        finish_us += std::chrono::duration_cast<std::chrono::microseconds>(dl_t1 - dl_t0).count();
+        const VAddr window = Common::AlignDown(device_addr, READBACK_WINDOW_SIZE);
+        windows += window != last_window;
+        last_window = window;
+        if (dl_t1 - last_report >= std::chrono::seconds{5}) {
+            LOG_WARNING(Render,
+                        "DLSTATS 5s: downloads={} finish_ms={} (avg {} us) bytes={} changed={} "
+                        "window_switches={}",
+                        calls, finish_us / 1000, calls ? finish_us / calls : 0, bytes, diff, windows);
+            calls = bytes = diff = finish_us = windows = 0;
+            last_report = dl_t1;
+        }
+    }
     WriteBackDownloads(arena_base, copies, download.mapped, download.offset);
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
 }
