@@ -1845,19 +1845,22 @@ u64 PipelineCache::CreateProgramSlow(HwStage stage, SwStage l_stage,
     created_slot = std::make_unique<Program>(stage, l_stage, params);
     auto start = binding;
     auto ri_compile = runtime_info;
-    const auto module = CompileModule(created_slot->info, ri_compile, params.code, 0, binding);
+    // The store can hold permutations of this program that were not preloaded.
+    const u32 perm_idx = Storage::DataBase::Instance().AllocateShaderBinaryIndex(params.hash, 0);
+    const auto module =
+        CompileModule(created_slot->info, ri_compile, params.code, perm_idx, binding);
     NoteSharpVerdicts(created_slot->info);
     auto spec = Shader::StageSpecialization(created_slot->info, ri_compile, profile, start);
-    const auto perm_hash = HashCombine(params.hash, 0);
+    const auto perm_hash = HashCombine(params.hash, perm_idx);
 
     if (spec_fp_cache) {
         spec.ComputeSig();
     }
-    RegisterShaderMeta(created_slot->info, spec.fetch_shader_data, spec, perm_hash, 0);
-    created_slot->AddPermut(module, std::move(spec));
+    RegisterShaderMeta(created_slot->info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+    created_slot->InsertPermut(module, std::move(spec), perm_idx);
     id.program = created_slot.get();
     id.program_hash = params.hash;
-    return Publish(out_slot, l_stage, &created_slot->info, module, created_slot.get(), 0u,
+    return Publish(out_slot, l_stage, &created_slot->info, module, created_slot.get(), perm_idx,
                    perm_hash);
 }
 
@@ -2070,8 +2073,10 @@ u64 PipelineCache::GetProgram(HwStage stage, SwStage l_stage, const Shader::Shad
                 spec_fp = spec_fp ? spec_fp : 1;
             }
         } else {
-            spec_fp = ComputeSpecProxyFp(info, program->modules[0].spec.fetch_shader_data,
-                                         ri_fp_hash, binding);
+            // Stored indices can leave modules[0] empty; use the first occupied permutation.
+            const auto first = std::ranges::find_if(
+                program->modules, [](const Program::Module& m) { return !!m.module; });
+            spec_fp = ComputeSpecProxyFp(info, first->spec.fetch_shader_data, ri_fp_hash, binding);
         }
         // A resolved hit: the MRU carries the module so the strided Module
         // load is skipped on repeats, and value 2 records the key.
@@ -2249,12 +2254,15 @@ u64 PipelineCache::ResolvePermutationSlow(HwStage stage, SwStage l_stage,
         }
     }
     if (hit_idx == std::numeric_limits<size_t>::max()) {
+        perm_idx = Storage::DataBase::Instance().AllocateShaderBinaryIndex(
+            params.hash, static_cast<u32>(program->modules.size()));
+        perm_hash = HashCombine(params.hash, perm_idx);
         auto new_info = Shader::Info(stage, l_stage, params);
         auto ri_compile = runtime_info;
         module = CompileModule(new_info, ri_compile, params.code, perm_idx, binding);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
-        program->AddPermut(module, std::move(spec));
+        program->InsertPermut(module, std::move(spec), perm_idx);
     } else {
         info.AddBindings(binding);
         module = program->modules[hit_idx].module;

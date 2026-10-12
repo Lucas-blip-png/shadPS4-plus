@@ -8,7 +8,9 @@
 #include "common/types.h"
 
 #include <functional>
+#include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace Storage {
@@ -42,7 +44,16 @@ public:
 
     void ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func);
 
+    /// Returns an index at least min_index and above every permutation of the program already
+    /// stored. A stored permutation that was not preloaded still owns its index; reusing it would
+    /// overwrite its .spv and .meta with another specialization.
+    u32 AllocateShaderBinaryIndex(u64 pgm_hash, u32 min_index);
+
 private:
+    void ScanShaderBinaryIndices();
+
+    std::mutex index_mutex{};
+    std::unordered_map<u64, u32> next_binary_index{};
     std::jthread io_worker{};
     std::filesystem::path cache_path{};
     bool opened{};
