@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -397,13 +398,12 @@ void ResetRouting(System& sys, Voice& voice) {
     sys.order_dirty = true;
 }
 
-// Envelope heights ramp linearly between points; durations are milliseconds
-void AdvanceEnvelope(SamplerData& s, u32 sample_rate, double samples) {
+// Envelope heights ramp linearly between points; durations are output samples
+void AdvanceEnvelope(SamplerData& s, double samples) {
     const auto& points = s.releasing ? s.release : s.forward;
-    const double samples_per_ms = static_cast<double>(sample_rate) / 1000.0;
     while (s.env_point < points.size()) {
         const OrbisNgs2EnvelopePoint& point = points[s.env_point];
-        const double duration = static_cast<double>(point.duration) * samples_per_ms;
+        const double duration = static_cast<double>(point.duration);
         const double remaining = duration - s.env_progress;
         if (remaining <= samples) {
             samples -= remaining;
@@ -420,13 +420,13 @@ void AdvanceEnvelope(SamplerData& s, u32 sample_rate, double samples) {
     }
 }
 
-void StartEnvelope(SamplerData& s, u32 sample_rate) {
+void StartEnvelope(SamplerData& s) {
     s.releasing = false;
     s.env_level = s.forward.empty() ? 1.0f : 0.0f;
     s.env_start = s.env_level;
     s.env_progress = 0.0;
     s.env_point = 0;
-    AdvanceEnvelope(s, sample_rate, 0.0);
+    AdvanceEnvelope(s, 0.0);
 }
 
 void StartRelease(SamplerData& s) {
@@ -454,9 +454,16 @@ void ReleaseVoice(Voice& voice) {
     voice.state = VoiceState::Free;
 }
 
+const char* StateName(VoiceState state);
+bool DiagVoice();
+
 // A voice that ran out of audio keeps its stream so the last block stays visible in its state
 void FinishVoice(Voice& voice) {
     SamplerData& s = *voice.sampler;
+    if (DiagVoice()) {
+        LOG_INFO(Lib_Ngs2, "NGS2DIAG finished rack={:#x} voice={} state={} queue={}", voice.rack->rack_id,
+                 voice.index, StateName(voice.state), s.stream.QueueSize());
+    }
     s.fifo_frames = 0;
     s.phase = 0.0;
     s.releasing = false;
@@ -464,7 +471,42 @@ void FinishVoice(Voice& voice) {
     voice.state = VoiceState::Free;
 }
 
+const char* StateName(VoiceState state) {
+    switch (state) {
+    case VoiceState::Free:
+        return "free";
+    case VoiceState::Idle:
+        return "idle";
+    case VoiceState::Playing:
+        return "playing";
+    case VoiceState::Paused:
+        return "paused";
+    case VoiceState::Stopping:
+        return "stopping";
+    }
+    return "?";
+}
+
+// Lifecycle log of sampler voices (Info level), capped so a long run cannot flood the log
+bool DiagVoice() {
+    static std::atomic<u32> lines{0};
+    return lines.fetch_add(1, std::memory_order_relaxed) < 30000;
+}
+
 void HandleEvent(System& sys, Voice& voice, u32 event_id) {
+    const VoiceState state_before = voice.state;
+    struct EventLog {
+        Voice& voice;
+        u32 event_id;
+        VoiceState before;
+        ~EventLog() {
+            if (voice.sampler && DiagVoice()) {
+                LOG_INFO(Lib_Ngs2, "NGS2DIAG event rack={:#x} voice={} id={} {} -> {} queue={}",
+                         voice.rack->rack_id, voice.index, event_id, StateName(before),
+                         StateName(voice.state), voice.sampler->stream.QueueSize());
+            }
+        }
+    } event_log{voice, event_id, state_before};
     auto& events = sys.stats.events;
     if (events.size() < MAX_USER_COUNTERS || events.count(event_id)) {
         events[event_id]++;
@@ -475,7 +517,7 @@ void HandleEvent(System& sys, Voice& voice, u32 event_id) {
     case EVENT_PLAY:
         if (sampler && (voice.state == VoiceState::Idle || voice.state == VoiceState::Free) &&
             sampler->stream.Configured()) {
-            StartEnvelope(*sampler, sys.sample_rate);
+            StartEnvelope(*sampler);
             voice.state = VoiceState::Playing;
         } else if (is_bus && voice.state == VoiceState::Idle) {
             voice.state = VoiceState::Playing;
@@ -630,6 +672,15 @@ void ApplySamplerEnvelope(System& sys, SamplerData& sampler,
     }
     sampler.forward.assign(points.begin(), points.begin() + param->numForwardPoints);
     sampler.release.assign(points.begin() + param->numForwardPoints, points.end());
+    if (DiagVoice()) {
+        std::string text;
+        for (size_t i = 0; i < points.size() && i < 8; i++) {
+            text += fmt::format(" {}{}:{}", i < param->numForwardPoints ? 'f' : 'r',
+                                points[i].duration, points[i].height);
+        }
+        LOG_INFO(Lib_Ngs2, "NGS2DIAG envelope forward={} release={} points{}", param->numForwardPoints,
+                 param->numReleasePoints, text);
+    }
 }
 
 void ApplyWaveformBlocks(System& sys, SamplerData& sampler,
@@ -677,6 +728,12 @@ void ApplySamplerSetup(System& sys, Voice& voice, const OrbisNgs2VoiceParamHeade
     SamplerData& sampler = *voice.sampler;
     OrbisNgs2WaveformFormat format;
     std::memcpy(&format, &header + 1, sizeof(format));
+    if (DiagVoice()) {
+        LOG_INFO(Lib_Ngs2,
+                 "NGS2DIAG setup rack={:#x} voice={} type={:#x} ch={} rate={} state_before={} queue={}",
+                 voice.rack->rack_id, voice.index, format.waveformType, format.numChannels,
+                 format.sampleRate, StateName(voice.state), sampler.stream.QueueSize());
+    }
     ResetSamplerPlayback(sampler);
     sampler.stream.Configure(format);
     sampler.source_rate = format.sampleRate;
@@ -701,9 +758,24 @@ void ApplySampler(System& sys, Voice& voice, const OrbisNgs2VoiceParamHeader& he
     case SAMPLER_SETUP:
         ApplySamplerSetup(sys, voice, header);
         break;
-    case SAMPLER_WAVEFORM_BLOCKS:
+    case SAMPLER_WAVEFORM_BLOCKS: {
+        const size_t queue_before = sampler.stream.QueueSize();
         ApplyWaveformBlocks(sys, sampler, header);
+        if (const auto* param = ParamAs<OrbisNgs2SamplerVoiceWaveformBlocksParam>(sys, header);
+            param && DiagVoice()) {
+            std::string first;
+            if (param->numBlocks != 0 && IsGuestRangeValid(param->aBlock, sizeof(OrbisNgs2WaveformBlock))) {
+                const OrbisNgs2WaveformBlock& b = param->aBlock[0];
+                first = fmt::format(" first{{dataSize={} samples={} repeats={} skip={}}}", b.dataSize,
+                                    b.numSamples, b.numRepeats, b.numSkipSamples);
+            }
+            LOG_INFO(Lib_Ngs2,
+                     "NGS2DIAG blocks rack={:#x} voice={} flags={:#x} numBlocks={} queue {}->{} state={}{}",
+                     voice.rack->rack_id, voice.index, param->flags, param->numBlocks, queue_before,
+                     sampler.stream.QueueSize(), StateName(voice.state), first);
+        }
         break;
+    }
     case SAMPLER_EXIT_LOOP:
         sampler.stream.ExitLoop();
         break;
@@ -1023,7 +1095,7 @@ bool RenderSamplerVoice(System& sys, Voice& voice, u32& out_channels) {
     s.phase = position;
 
     const float start_gain = s.env_level;
-    AdvanceEnvelope(s, sys.sample_rate, grain);
+    AdvanceEnvelope(s, grain);
     const float end_gain = s.env_level;
     if (start_gain != 1.0f || end_gain != 1.0f) {
         const float delta = (end_gain - start_gain) / static_cast<float>(grain);

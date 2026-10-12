@@ -53,6 +53,9 @@ public:
     u32 AddBlocks(const WaveformBlockEntry* blocks, u32 count, u32 flags);
     u32 Pull(float* dst, u32 max_frames);
 
+    size_t QueueSize() const {
+        return blocks.size();
+    }
     u32 NumChannels() const {
         return channels;
     }
