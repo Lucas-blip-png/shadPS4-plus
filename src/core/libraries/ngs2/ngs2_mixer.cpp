@@ -652,6 +652,11 @@ void ApplyWaveformBlocks(System& sys, SamplerData& sampler,
     for (u32 i = 0; i < count; i++) {
         const OrbisNgs2WaveformBlock& block = param->aBlock[i];
         const u8* base = static_cast<const u8*>(param->data);
+        if (block.dataSize == 0 && block.numSamples != 0) {
+            entries.push_back(
+                {nullptr, 0, block.numRepeats, 0, block.numSamples, block.userData, false});
+            continue;
+        }
         if (!base || block.dataSize == 0 ||
             !IsGuestRangeValid(base + block.dataOffset, block.dataSize)) {
             NoteInvalid(sys);

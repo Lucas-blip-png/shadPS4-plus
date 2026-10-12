@@ -194,6 +194,11 @@ void WaveformStream::StartPass(bool first_pass) {
     if (first_pass) {
         cursor.repeats_left = block.numRepeats;
     }
+    if (!block.data) {
+        cursor.skip_left = 0;
+        cursor.unlimited = false;
+        return;
+    }
     switch (codec) {
     case WaveformCodec::PcmI16:
     case WaveformCodec::PcmF32: {
@@ -318,7 +323,7 @@ u32 WaveformStream::Pull(float* dst, u32 max_frames) {
         float* out = dst + static_cast<size_t>(produced) * channels;
         const u32 want = max_frames - produced;
         u32 frames = 0;
-        switch (codec) {
+        switch (blocks.front().data ? codec : WaveformCodec::Unsupported) {
         case WaveformCodec::PcmI16:
         case WaveformCodec::PcmF32:
             frames = PullPcm(out, want, pass_done);
