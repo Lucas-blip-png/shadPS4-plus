@@ -1,0 +1,16 @@
+{
+  "GPU": {
+    "readbacks_mode": 2,
+    "readback_offload": true,
+    "readback_transfer_queue": true,
+    "gpu_thread_core_reserve": true,
+    "one_thread_per_core": false,
+    "stream_copy_lane_threads": 2,
+    "real_occlusion_queries": true,
+    "threaded_cmd_recording": true
+  },
+  "Vulkan": {
+    "pipeline_cache_enabled": true,
+    "pipeline_cache_archived": false
+  }
+}

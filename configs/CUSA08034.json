@@ -1,0 +1,27 @@
+{
+  "General": {
+    "extra_dmem_in_mbytes": 1024,
+    "poll_connected_pads_only": true
+  },
+  "GPU": {
+    "readbacks_mode": 2,
+    "readback_offload": true,
+    "readback_transfer_queue": true,
+    "gpu_thread_core_reserve": true,
+    "threaded_cmd_recording": true,
+    "stream_copy_workers": 2,
+    "arena_reserve_mb": 2560,
+    "preserve_split_protection": true,
+    "cpu_authoritative_stacks": true,
+    "bpe_heap_guard_address": 14787083552,
+    "compute_loop_cap": 1048576,
+    "dynamic_tsharp_array_size": 16,
+    "early_fragment_tests_from_z_order": true,
+    "lds_barrier_uniform_readlane": true,
+    "wave64_uniform_branches": true,
+    "lod_stats_from_bindings": true
+  },
+  "Vulkan": {
+    "pipeline_cache_enabled": true
+  }
+}
