@@ -1,6 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <fmt/format.h>
+
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
@@ -11,8 +22,241 @@
 #include "core/libraries/ngs2/ngs2_impl.h"
 #include "core/libraries/ngs2/ngs2_pan.h"
 #include "core/libraries/ngs2/ngs2_report.h"
+#include "core/libraries/ngs2/ngs2_sampler.h"
 
 namespace Libraries::Ngs2 {
+
+// Rack and voice handles are opaque to the game. Until NGS2 is really emulated these are fake,
+// unique, non-null values: rack n -> n << 24, voice i of that rack -> rack | (i + 1) << 4.
+// The records below only exist so the diagnostics can say which rack a voice belongs to.
+namespace {
+
+struct RackRecord {
+    u32 rackId;
+    u32 maxVoices;
+};
+
+constexpr u32 DIAG_MAX_DETAILED_CALLS = 200;
+constexpr u32 DIAG_MAX_DETAILED_RENDERS = 50;
+constexpr u32 DIAG_MAX_PARAMS_PER_CALL = 64;
+constexpr u64 DIAG_SUMMARY_PERIOD_US = 5'000'000;
+
+std::mutex diag_mutex;
+// ponytail: never shrinks, racks are created a handful of times per run; free on RackDestroy
+// once the real implementation tracks them.
+std::vector<RackRecord> rack_records;
+std::map<u32, u64> param_id_counts; // guarded by diag_mutex
+
+std::atomic<u64> voice_control_calls{0};
+std::atomic<u64> voice_control_params{0};
+std::atomic<u64> voice_get_state_calls{0};
+std::atomic<u64> render_calls{0};
+std::atomic<u64> last_summary_us{0};
+u64 prev_voice_control_calls = 0;
+u64 prev_voice_get_state_calls = 0;
+u64 prev_render_calls = 0;
+
+bool DiagEnabled() {
+    return Common::Log::ShouldLog(Common::Log::Class::Lib_Ngs2, Common::Log::Level::Info);
+}
+
+u64 NowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+std::string_view FixedName(const char* name, size_t max) {
+    size_t len = 0;
+    while (len < max && name[len] != '\0') {
+        len++;
+    }
+    return {name, len};
+}
+
+OrbisNgs2Handle NewFakeRackHandle(u32 rackId, u32 maxVoices) {
+    std::scoped_lock lock{diag_mutex};
+    rack_records.push_back({rackId, maxVoices});
+    return static_cast<OrbisNgs2Handle>(rack_records.size()) << 24;
+}
+
+OrbisNgs2Handle FakeVoiceHandle(OrbisNgs2Handle rackHandle, u32 voiceIndex) {
+    return rackHandle | ((static_cast<OrbisNgs2Handle>(voiceIndex % 0xFFFFF) + 1) << 4);
+}
+
+std::string DescribeVoice(OrbisNgs2Handle voice) {
+    const u64 rack_index = voice >> 24;
+    const u64 voice_index = ((voice >> 4) & 0xFFFFF);
+    std::scoped_lock lock{diag_mutex};
+    if (rack_index == 0 || rack_index > rack_records.size() || voice_index == 0) {
+        return "unknown";
+    }
+    return fmt::format("rack#{} rackId={:#x} voice={}", rack_index,
+                       rack_records[rack_index - 1].rackId, voice_index - 1);
+}
+
+void LogSystemOption(const char* api, const OrbisNgs2SystemOption* option) {
+    if (!option) {
+        LOG_INFO(Lib_Ngs2, "{}: option=null (defaults 48000 Hz, grain 256/512)", api);
+        return;
+    }
+    LOG_INFO(Lib_Ngs2,
+             "{}: option size={} name='{}' flags={:#x} sampleRate={} numGrainSamples={} "
+             "maxGrainSamples={}",
+             api, option->size, FixedName(option->name, sizeof(option->name)), option->flags,
+             option->sampleRate, option->numGrainSamples, option->maxGrainSamples);
+}
+
+void LogRackOption(const char* api, u32 rackId, const OrbisNgs2RackOption* option) {
+    if (!option) {
+        LOG_INFO(Lib_Ngs2, "{}: rackId={} ({:#x}) option=null", api, rackId, rackId);
+        return;
+    }
+    LOG_INFO(Lib_Ngs2,
+             "{}: rackId={} ({:#x}) option size={} name='{}' flags={:#x} maxGrainSamples={} "
+             "maxVoices={} maxInputDelayBlocks={} maxMatrices={} maxPorts={}",
+             api, rackId, rackId, option->size, FixedName(option->name, sizeof(option->name)),
+             option->flags, option->maxGrainSamples, option->maxVoices,
+             option->maxInputDelayBlocks, option->maxMatrices, option->maxPorts);
+    // Sampler rack options extend the base option by nine u32 fields
+    if ((rackId & 0xF000) == 0x1000 &&
+        option->size >= sizeof(OrbisNgs2RackOption) + 9 * sizeof(u32)) {
+        const auto* s = reinterpret_cast<const OrbisNgs2SamplerRackOption*>(option);
+        LOG_INFO(Lib_Ngs2,
+                 "{}:   sampler option maxChannelWorks={} maxCodecCaches={} maxWaveformBlocks={} "
+                 "maxEnvelopePoints={} maxFilters={} maxAtrac9Decoders={} maxAtrac9ChannelWorks={} "
+                 "maxAjmAtrac9Decoders={} numPeakMeterBlocks={}",
+                 api, s->maxChannelWorks, s->maxCodecCaches, s->maxWaveformBlocks,
+                 s->maxEnvelopePoints, s->maxFilters, s->maxAtrac9Decoders,
+                 s->maxAtrac9ChannelWorks, s->maxAjmAtrac9Decoders, s->numPeakMeterBlocks);
+    }
+}
+
+// One line every DIAG_SUMMARY_PERIOD_US with call counts and a histogram of VoiceControl param ids
+void MaybeLogSummary() {
+    if (!DiagEnabled()) {
+        return;
+    }
+    const u64 now = NowUs();
+    u64 last = last_summary_us.load(std::memory_order_relaxed);
+    if (now - last < DIAG_SUMMARY_PERIOD_US ||
+        !last_summary_us.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        return;
+    }
+    const u64 vc = voice_control_calls.load(std::memory_order_relaxed);
+    const u64 gs = voice_get_state_calls.load(std::memory_order_relaxed);
+    const u64 rc = render_calls.load(std::memory_order_relaxed);
+    std::string ids;
+    {
+        std::scoped_lock lock{diag_mutex};
+        for (const auto& [id, count] : param_id_counts) {
+            ids += fmt::format(" {:#x}:{}", id, count);
+        }
+        LOG_INFO(Lib_Ngs2,
+                 "summary: VoiceControl calls={} (+{}) params={} GetState calls={} (+{}) "
+                 "SystemRender calls={} (+{}) racks={} paramIds={{{} }}",
+                 vc, vc - prev_voice_control_calls,
+                 voice_control_params.load(std::memory_order_relaxed), gs,
+                 gs - prev_voice_get_state_calls, rc, rc - prev_render_calls, rack_records.size(),
+                 ids);
+        prev_voice_control_calls = vc;
+        prev_voice_get_state_calls = gs;
+        prev_render_calls = rc;
+    }
+}
+
+void LogVoiceParam(u32 index, const OrbisNgs2VoiceParamHeader* p) {
+    std::string words;
+    if (p->size > sizeof(OrbisNgs2VoiceParamHeader)) {
+        const u32 num_words = std::min<u32>((p->size - sizeof(OrbisNgs2VoiceParamHeader)) / 4, 10);
+        const u32* payload = reinterpret_cast<const u32*>(p + 1);
+        for (u32 i = 0; i < num_words; i++) {
+            words += fmt::format(" {:08x}", payload[i]);
+        }
+    }
+    LOG_INFO(Lib_Ngs2, "  param[{}] id={:#010x} size={} next={} payload:{}", index, p->id, p->size,
+             p->next, words);
+    // The id alone does not say which struct this is; decode by size as a hint only.
+    if (p->size == sizeof(OrbisNgs2SamplerVoiceSetupParam)) {
+        const auto* sp = reinterpret_cast<const OrbisNgs2SamplerVoiceSetupParam*>(p);
+        LOG_INFO(Lib_Ngs2,
+                 "    if SamplerVoiceSetup: waveformType={:#x} numChannels={} sampleRate={} "
+                 "configData={:#x} frameOffset={} frameMargin={} flags={:#x}",
+                 sp->format.waveformType, sp->format.numChannels, sp->format.sampleRate,
+                 sp->format.configData, sp->format.frameOffset, sp->format.frameMargin, sp->flags);
+    } else if (p->size == sizeof(OrbisNgs2SamplerVoiceWaveformBlocksParam)) {
+        const auto* bp = reinterpret_cast<const OrbisNgs2SamplerVoiceWaveformBlocksParam*>(p);
+        LOG_INFO(Lib_Ngs2, "    if SamplerVoiceWaveformBlocks: data={} flags={:#x} numBlocks={}",
+                 bp->data, bp->flags, bp->numBlocks);
+        if (bp->aBlock && bp->numBlocks >= 1 && bp->numBlocks <= 64) {
+            for (u32 b = 0; b < std::min<u32>(bp->numBlocks, 4); b++) {
+                const auto& blk = bp->aBlock[b];
+                LOG_INFO(Lib_Ngs2,
+                         "      block[{}] dataOffset={} dataSize={} numRepeats={} "
+                         "numSkipSamples={} numSamples={}",
+                         b, blk.dataOffset, blk.dataSize, blk.numRepeats, blk.numSkipSamples,
+                         blk.numSamples);
+            }
+            // First bytes of the waveform data help identify the codec (RIFF, VAGp, ...)
+            const auto& first = bp->aBlock[0];
+            if (bp->data && first.dataSize >= 16) {
+                const u8* bytes = static_cast<const u8*>(bp->data) + first.dataOffset;
+                std::string hex;
+                for (u32 i = 0; i < 16; i++) {
+                    hex += fmt::format("{:02x}", bytes[i]);
+                }
+                LOG_INFO(Lib_Ngs2, "      block[0] first 16 bytes: {}", hex);
+            }
+        }
+    }
+}
+
+void DiagVoiceControl(OrbisNgs2Handle voice, const OrbisNgs2VoiceParamHeader* list) {
+    const u64 call = voice_control_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool detailed = call <= DIAG_MAX_DETAILED_CALLS;
+    if (detailed) {
+        LOG_INFO(Lib_Ngs2, "VoiceControl #{} voice={:#x} ({}) list={}", call, voice,
+                 DescribeVoice(voice), static_cast<const void*>(list));
+    }
+    const OrbisNgs2VoiceParamHeader* p = list;
+    for (u32 i = 0; p && i < DIAG_MAX_PARAMS_PER_CALL; i++) {
+        voice_control_params.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::scoped_lock lock{diag_mutex};
+            // Bounded: a corrupt list must not grow the histogram forever
+            if (param_id_counts.size() < 256 || param_id_counts.count(p->id)) {
+                param_id_counts[p->id]++;
+            }
+        }
+        if (detailed) {
+            LogVoiceParam(i, p);
+        }
+        // next is a byte offset to the following header; 0 ends the chain. Refuse implausible
+        // offsets instead of reading arbitrary guest memory.
+        if (p->next <= 0 || p->next < p->size || p->next > 4096) {
+            break;
+        }
+        p = reinterpret_cast<const OrbisNgs2VoiceParamHeader*>(reinterpret_cast<const u8*>(p) +
+                                                                p->next);
+    }
+    MaybeLogSummary();
+}
+
+void DiagRender(OrbisNgs2Handle system, const OrbisNgs2RenderBufferInfo* buffers, u32 num) {
+    const u64 call = render_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (call <= DIAG_MAX_DETAILED_RENDERS) {
+        LOG_INFO(Lib_Ngs2, "SystemRender #{} system={:#x} numBufferInfo={}", call, system, num);
+        for (u32 i = 0; buffers && i < std::min<u32>(num, 16); i++) {
+            LOG_INFO(Lib_Ngs2,
+                     "  buf[{}] ptr={} size={} waveformType={:#x} numChannels={}", i,
+                     buffers[i].buffer, buffers[i].bufferSize, buffers[i].waveformType,
+                     buffers[i].numChannels);
+        }
+    }
+    MaybeLogSummary();
+}
+
+} // namespace
 
 // Ngs2
 
@@ -51,10 +295,15 @@ s32 PS4_SYSV_ABI sceNgs2RackCreate(OrbisNgs2Handle systemHandle, u32 rackId,
                                    const OrbisNgs2RackOption* option,
                                    const OrbisNgs2ContextBufferInfo* bufferInfo,
                                    OrbisNgs2Handle* outHandle) {
-    LOG_ERROR(Lib_Ngs2, "rackId = {}", rackId);
+    LogRackOption("sceNgs2RackCreate", rackId, option);
     if (!systemHandle) {
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+    }
+    if (outHandle) {
+        *outHandle = NewFakeRackHandle(rackId, option ? option->maxVoices : 0);
+        LOG_INFO(Lib_Ngs2, "sceNgs2RackCreate: rackId={:#x} -> fake rack handle {:#x}", rackId,
+                 *outHandle);
     }
     return ORBIS_OK;
 }
@@ -63,10 +312,15 @@ s32 PS4_SYSV_ABI sceNgs2RackCreateWithAllocator(OrbisNgs2Handle systemHandle, u3
                                                 const OrbisNgs2RackOption* option,
                                                 const OrbisNgs2BufferAllocator* allocator,
                                                 OrbisNgs2Handle* outHandle) {
-    LOG_ERROR(Lib_Ngs2, "rackId = {}", rackId);
+    LogRackOption("sceNgs2RackCreateWithAllocator", rackId, option);
     if (!systemHandle) {
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+    }
+    if (outHandle) {
+        *outHandle = NewFakeRackHandle(rackId, option ? option->maxVoices : 0);
+        LOG_INFO(Lib_Ngs2, "sceNgs2RackCreateWithAllocator: rackId={:#x} -> fake rack handle {:#x}",
+                 rackId, *outHandle);
     }
     return ORBIS_OK;
 }
@@ -90,18 +344,26 @@ s32 PS4_SYSV_ABI sceNgs2RackGetUserData(OrbisNgs2Handle rackHandle, uintptr_t* o
 
 s32 PS4_SYSV_ABI sceNgs2RackGetVoiceHandle(OrbisNgs2Handle rackHandle, u32 voiceIndex,
                                            OrbisNgs2Handle* outHandle) {
-    LOG_DEBUG(Lib_Ngs2, "(STUBBED) voiceIndex = {}", voiceIndex);
+    if (outHandle) {
+        *outHandle = FakeVoiceHandle(rackHandle, voiceIndex);
+    }
+    static std::atomic<u32> logged{0};
+    if (logged.load(std::memory_order_relaxed) < 64 && DiagEnabled()) {
+        logged.fetch_add(1, std::memory_order_relaxed);
+        LOG_INFO(Lib_Ngs2, "sceNgs2RackGetVoiceHandle: rack={:#x} voiceIndex={} -> {:#x}",
+                 rackHandle, voiceIndex, FakeVoiceHandle(rackHandle, voiceIndex));
+    }
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2RackLock(OrbisNgs2Handle rackHandle) {
-    LOG_ERROR(Lib_Ngs2, "called");
+    LOG_DEBUG(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2RackQueryBufferSize(u32 rackId, const OrbisNgs2RackOption* option,
                                             OrbisNgs2ContextBufferInfo* outBufferInfo) {
-    LOG_ERROR(Lib_Ngs2, "rackId = {}", rackId);
+    LogRackOption("sceNgs2RackQueryBufferSize", rackId, option);
     return RackQueryBufferSize(option, outBufferInfo);
 }
 
@@ -111,7 +373,7 @@ s32 PS4_SYSV_ABI sceNgs2RackSetUserData(OrbisNgs2Handle rackHandle, uintptr_t us
 }
 
 s32 PS4_SYSV_ABI sceNgs2RackUnlock(OrbisNgs2Handle rackHandle) {
-    LOG_ERROR(Lib_Ngs2, "called");
+    LOG_DEBUG(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
 
@@ -120,6 +382,7 @@ s32 PS4_SYSV_ABI sceNgs2SystemCreate(const OrbisNgs2SystemOption* option,
                                      OrbisNgs2Handle* outHandle) {
     s32 result;
     OrbisNgs2ContextBufferInfo localInfo;
+    LogSystemOption("sceNgs2SystemCreate", option);
     if (!bufferInfo || !outHandle) {
         if (!bufferInfo) {
             result = ORBIS_NGS2_ERROR_INVALID_BUFFER_INFO;
@@ -152,6 +415,7 @@ s32 PS4_SYSV_ABI sceNgs2SystemCreateWithAllocator(const OrbisNgs2SystemOption* o
                                                   const OrbisNgs2BufferAllocator* allocator,
                                                   OrbisNgs2Handle* outHandle) {
     s32 result;
+    LogSystemOption("sceNgs2SystemCreateWithAllocator", option);
     if (allocator && allocator->allocHandler != 0) {
         OrbisNgs2BufferAllocHandler hostAlloc = allocator->allocHandler;
         if (outHandle) {
@@ -219,7 +483,7 @@ s32 PS4_SYSV_ABI sceNgs2SystemGetUserData(OrbisNgs2Handle systemHandle, uintptr_
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
     }
-    LOG_ERROR(Lib_Ngs2, "called");
+    LOG_DEBUG(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
 
@@ -228,7 +492,7 @@ s32 PS4_SYSV_ABI sceNgs2SystemLock(OrbisNgs2Handle systemHandle) {
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
     }
-    LOG_ERROR(Lib_Ngs2, "called");
+    LOG_DEBUG(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
 
@@ -254,6 +518,10 @@ s32 PS4_SYSV_ABI sceNgs2SystemRender(OrbisNgs2Handle systemHandle,
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
     }
+    // Nothing is rendered: the guest buffers are left untouched
+    if (DiagEnabled()) {
+        DiagRender(systemHandle, aBufferInfo, numBufferInfo);
+    }
     return ORBIS_OK;
 }
 
@@ -272,7 +540,7 @@ static s32 PS4_SYSV_ABI sceNgs2SystemResetOption(OrbisNgs2SystemOption* outOptio
 }
 
 s32 PS4_SYSV_ABI sceNgs2SystemSetGrainSamples(OrbisNgs2Handle systemHandle, u32 numSamples) {
-    LOG_ERROR(Lib_Ngs2, "numSamples = {}", numSamples);
+    LOG_INFO(Lib_Ngs2, "sceNgs2SystemSetGrainSamples: numSamples = {}", numSamples);
     if (!systemHandle) {
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
@@ -281,7 +549,7 @@ s32 PS4_SYSV_ABI sceNgs2SystemSetGrainSamples(OrbisNgs2Handle systemHandle, u32 
 }
 
 s32 PS4_SYSV_ABI sceNgs2SystemSetSampleRate(OrbisNgs2Handle systemHandle, u32 sampleRate) {
-    LOG_ERROR(Lib_Ngs2, "sampleRate = {}", sampleRate);
+    LOG_INFO(Lib_Ngs2, "sceNgs2SystemSetSampleRate: sampleRate = {}", sampleRate);
     if (!systemHandle) {
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
@@ -303,42 +571,52 @@ s32 PS4_SYSV_ABI sceNgs2SystemUnlock(OrbisNgs2Handle systemHandle) {
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
     }
-    LOG_ERROR(Lib_Ngs2, "called");
+    LOG_DEBUG(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2VoiceControl(OrbisNgs2Handle voiceHandle,
                                      const OrbisNgs2VoiceParamHeader* paramList) {
-    LOG_ERROR(Lib_Ngs2, "called");
+    // Hot path (per audio grain). Params are not applied yet, only logged at Info for diagnosis.
+    if (DiagEnabled()) {
+        DiagVoiceControl(voiceHandle, paramList);
+    }
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2VoiceGetMatrixInfo(OrbisNgs2Handle voiceHandle, u32 matrixId,
                                            OrbisNgs2VoiceMatrixInfo* outInfo, size_t outInfoSize) {
-    LOG_ERROR(Lib_Ngs2, "matrixId = {}, outInfoSize = {}", matrixId, outInfoSize);
+    LOG_DEBUG(Lib_Ngs2, "matrixId = {}, outInfoSize = {}", matrixId, outInfoSize);
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2VoiceGetOwner(OrbisNgs2Handle voiceHandle, OrbisNgs2Handle* outRackHandle,
                                       u32* outVoiceId) {
-    LOG_ERROR(Lib_Ngs2, "called");
+    LOG_DEBUG(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2VoiceGetPortInfo(OrbisNgs2Handle voiceHandle, u32 port,
                                          OrbisNgs2VoicePortInfo* outInfo, size_t outInfoSize) {
-    LOG_ERROR(Lib_Ngs2, "port = {}, outInfoSize = {}", port, outInfoSize);
+    LOG_DEBUG(Lib_Ngs2, "port = {}, outInfoSize = {}", port, outInfoSize);
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2VoiceGetState(OrbisNgs2Handle voiceHandle, OrbisNgs2VoiceState* outState,
                                       size_t stateSize) {
-    LOG_ERROR(Lib_Ngs2, "stateSize = {}", stateSize);
+    // Polled every audio grain by SotC; stays quiet. The state is not written (no voice emulation)
+    LOG_DEBUG(Lib_Ngs2, "stateSize = {}", stateSize);
+    voice_get_state_calls.fetch_add(1, std::memory_order_relaxed);
+    MaybeLogSummary();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2VoiceGetStateFlags(OrbisNgs2Handle voiceHandle, u32* outStateFlags) {
-    LOG_ERROR(Lib_Ngs2, "called");
+    // Report an idle voice instead of leaving the caller's variable uninitialized
+    if (outStateFlags) {
+        *outStateFlags = 0;
+    }
+    LOG_DEBUG(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
 
