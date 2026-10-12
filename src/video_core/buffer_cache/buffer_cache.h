@@ -243,6 +243,9 @@ private:
     IntervalList<Backing> resident_ranges;
 
     u32 arena_memory_type_index{};
+    /// A memory type outside VRAM the arena falls back to when VRAM runs out; ~0 if none.
+    u32 arena_fallback_type_index{~0u};
+    mutable bool arena_fallback_logged{};
     /// With arena_reserve_mb set, arena memory is taken from 256 MB chunks, that many of them
     /// reserved at boot: on 8 GB cards images otherwise fill VRAM first and residency later finds
     /// none left. Without it, each EnsureResident call makes one allocation sized for its ranges.

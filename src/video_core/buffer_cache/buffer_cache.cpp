@@ -91,6 +91,17 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
                        reqs.memoryTypeBits)
             .value();
+    {
+        const auto& props = instance.GetMemoryProperties();
+        for (u32 i = 0; i < props.memoryTypeCount; ++i) {
+            const auto heap = props.memoryHeaps[props.memoryTypes[i].heapIndex];
+            if (((reqs.memoryTypeBits >> i) & 1) != 0 &&
+                !(heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
+                arena_fallback_type_index = i;
+                break;
+            }
+        }
+    }
     const u64 arena_reserve = u64{EmulatorSettings.GetArenaReserveMb()} << 20;
     arena_chunked = arena_reserve != 0;
     for (u64 reserved = 0; reserved < arena_reserve; reserved += ARENA_CHUNK_SIZE) {
@@ -731,12 +742,21 @@ vk::ResultValue<vk::DeviceMemory> BufferCache::AllocateArenaMemory(u64 size) con
     const vk::MemoryAllocateFlagsInfo alloc_flags = {
         .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
     };
-    const vk::MemoryAllocateInfo alloc_info = {
+    vk::MemoryAllocateInfo alloc_info = {
         .pNext = &alloc_flags,
         .allocationSize = size,
         .memoryTypeIndex = arena_memory_type_index,
     };
-    return instance.GetDevice().allocateMemory(alloc_info);
+    auto result = instance.GetDevice().allocateMemory(alloc_info);
+    if (result.result == vk::Result::eErrorOutOfDeviceMemory && arena_fallback_type_index != ~0u) {
+        if (!arena_fallback_logged) {
+            arena_fallback_logged = true;
+            LOG_WARNING(Render, "VRAM full: guest memory now made resident in system memory");
+        }
+        alloc_info.memoryTypeIndex = arena_fallback_type_index;
+        result = instance.GetDevice().allocateMemory(alloc_info);
+    }
+    return result;
 }
 
 std::tuple<vk::DeviceMemory, u64, u64> BufferCache::AllocateArenaPiece(u64 size) {
