@@ -464,6 +464,8 @@ set(SYSTEM_LIBS src/core/libraries/system/commondialog.cpp
                 src/core/libraries/ngs2/ngs2_eq.h
                 src/core/libraries/ngs2/ngs2_mastering.cpp
                 src/core/libraries/ngs2/ngs2_mastering.h
+                src/core/libraries/ngs2/ngs2_mixer.cpp
+                src/core/libraries/ngs2/ngs2_mixer.h
                 src/core/libraries/ngs2/ngs2_sampler.cpp
                 src/core/libraries/ngs2/ngs2_sampler.h
                 src/core/libraries/ngs2/ngs2_submixer.cpp
