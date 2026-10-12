@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -70,6 +73,78 @@ static AudioFormatInfo GetFormatInfo(const OrbisAudioOutParamFormat format) {
     const auto index = static_cast<u32>(format);
     ASSERT_MSG(index < format_infos.size(), "Unknown audio format {}", index);
     return format_infos[index];
+}
+
+// Diagnostics: summarize what the guest submits to each port. Costs nothing unless the
+// Lib.AudioOut log class is at Info or lower.
+struct OutputStats {
+    u64 window_start_us = 0;
+    u32 calls = 0;
+    u32 null_calls = 0;
+    u64 samples = 0;
+    u64 nonzero = 0;
+    double sum_sq = 0.0;
+    float peak = 0.0f;
+};
+static std::array<OutputStats, ORBIS_AUDIO_OUT_NUM_PORTS> output_stats{};
+static constexpr u64 OUTPUT_STATS_WINDOW_US = 2'000'000;
+
+template <typename T, typename F>
+static void AccumulateSamples(OutputStats& st, const T* data, u64 count, F&& to_float) {
+    for (u64 i = 0; i < count; i++) {
+        const float v = to_float(data[i]);
+        if (!std::isfinite(v)) {
+            continue;
+        }
+        const float a = std::fabs(v);
+        st.samples++;
+        st.nonzero += a > 0.0f ? 1 : 0;
+        st.sum_sq += static_cast<double>(v) * v;
+        st.peak = std::max(st.peak, a);
+    }
+}
+
+// Called with the port mutex held; data is the host copy of the submitted buffer (or null)
+static void RecordOutputStats(s32 port_id, const PortOut& port, const void* data) {
+    if (!Common::Log::ShouldLog(Common::Log::Class::Lib_AudioOut, Common::Log::Level::Info) ||
+        port_id < 0 || port_id >= ORBIS_AUDIO_OUT_NUM_PORTS) {
+        return;
+    }
+    OutputStats& st = output_stats[port_id];
+    const u64 now = Kernel::sceKernelGetProcessTime();
+    if (st.window_start_us == 0) {
+        st.window_start_us = now;
+    }
+    st.calls++;
+    if (data == nullptr) {
+        st.null_calls++;
+    } else {
+        const u64 count = static_cast<u64>(port.buffer_frames) * port.format_info.num_channels;
+        if (port.format_info.is_float) {
+            AccumulateSamples(st, static_cast<const float*>(data), count,
+                              [](float v) { return v; });
+        } else {
+            AccumulateSamples(st, static_cast<const s16*>(data), count,
+                              [](s16 v) { return static_cast<float>(v) * (1.0f / 32768.0f); });
+        }
+    }
+    const u64 elapsed = now - st.window_start_us;
+    if (elapsed < OUTPUT_STATS_WINDOW_US) {
+        return;
+    }
+    const double secs = static_cast<double>(elapsed) / 1e6;
+    const double rms = st.samples ? std::sqrt(st.sum_sq / static_cast<double>(st.samples)) : 0.0;
+    const double nonzero_pct =
+        st.samples ? 100.0 * static_cast<double>(st.nonzero) / static_cast<double>(st.samples)
+                   : 0.0;
+    LOG_INFO(Lib_AudioOut,
+             "output stats: port_id={} type={} {}ch {} frames={} calls={} ({:.1f}/s) null={} "
+             "peak={:.4f} rms={:.5f} nonzero={:.1f}% window={:.2f}s",
+             port_id, magic_enum::enum_name(port.type), port.format_info.num_channels,
+             port.format_info.is_float ? "float" : "s16", port.buffer_frames, st.calls,
+             st.calls / secs, st.null_calls, st.peak, rms, nonzero_pct, secs);
+    st = OutputStats{};
+    st.window_start_us = now;
 }
 
 /*
@@ -584,6 +659,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
             port->output_ready = true;
             samples_sent = port->buffer_frames * port->format_info.num_channels;
         }
+        RecordOutputStats(port_id, *port, ptr != nullptr ? port->output_buffer : nullptr);
     }
 
     return samples_sent;
@@ -689,6 +765,8 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
             std::memcpy(ports[i]->output_buffer, param[i].ptr, ports[i]->BufferSize());
             ports[i]->output_ready = true;
         }
+        RecordOutputStats(GetPortId(param[i].handle), *ports[i],
+                          param[i].ptr != nullptr ? ports[i]->output_buffer : nullptr);
     }
 
     return buffer_frames;
