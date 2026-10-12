@@ -753,6 +753,8 @@ struct GPUSettings {
     Setting<bool> early_fragment_tests_from_z_order{false};
     // Turn dynamically indexed compute T# reads into descriptor arrays of this size (0 = off, max 64)
     Setting<u32> dynamic_tsharp_array_size{0};
+    // On Windows, restore guest and GPU tracking protections after splitting a mapped placeholder
+    Setting<bool> preserve_split_protection{false};
 
 #define GPU_OVERRIDE(field) make_override<GPUSettings>(#field, &GPUSettings::field)
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -859,6 +861,7 @@ struct GPUSettings {
             GPU_OVERRIDE(compute_loop_cap),
             GPU_OVERRIDE(early_fragment_tests_from_z_order),
             GPU_OVERRIDE(dynamic_tsharp_array_size),
+            GPU_OVERRIDE(preserve_split_protection),
         };
     }
 #undef GPU_OVERRIDE
@@ -896,7 +899,8 @@ struct GPUSettings {
     cpu_authoritative_stacks, bpe_heap_guard_address, \
     wave64_uniform_branches, wave64_missing_lane_identity, lds_barrier_uniform_readlane, \
     lds_barriers_large_groups, compute_loop_cap, early_fragment_tests_from_z_order, \
-    dynamic_tsharp_array_size
+    dynamic_tsharp_array_size, \
+    preserve_split_protection
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1313,6 +1317,7 @@ public:
     SETTING_FORWARD(m_gpu, ComputeLoopCap, compute_loop_cap)
     SETTING_FORWARD_BOOL(m_gpu, EarlyFragmentTestsFromZOrder, early_fragment_tests_from_z_order)
     SETTING_FORWARD(m_gpu, DynamicTsharpArraySize, dynamic_tsharp_array_size)
+    SETTING_FORWARD_BOOL(m_gpu, PreserveSplitProtection, preserve_split_protection)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {
