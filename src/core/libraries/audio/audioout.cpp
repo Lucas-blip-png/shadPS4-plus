@@ -88,6 +88,7 @@ struct OutputStats {
 };
 static std::array<OutputStats, ORBIS_AUDIO_OUT_NUM_PORTS> output_stats{};
 static constexpr u64 OUTPUT_STATS_WINDOW_US = 2'000'000;
+static constexpr float OUTPUT_SIGNAL_THRESHOLD = 0.0005f;
 
 template <typename T, typename F>
 static void AccumulateSamples(OutputStats& st, const T* data, u64 count, F&& to_float) {
@@ -139,10 +140,11 @@ static void RecordOutputStats(s32 port_id, const PortOut& port, const void* data
                    : 0.0;
     LOG_INFO(Lib_AudioOut,
              "output stats: port_id={} type={} {}ch {} frames={} calls={} ({:.1f}/s) null={} "
-             "peak={:.4f} rms={:.5f} nonzero={:.1f}% window={:.2f}s",
+             "peak={:.4f} rms={:.5f} nonzero={:.1f}% signal={} window={:.2f}s",
              port_id, magic_enum::enum_name(port.type), port.format_info.num_channels,
              port.format_info.is_float ? "float" : "s16", port.buffer_frames, st.calls,
-             st.calls / secs, st.null_calls, st.peak, rms, nonzero_pct, secs);
+             st.calls / secs, st.null_calls, st.peak, rms, nonzero_pct,
+             st.peak > OUTPUT_SIGNAL_THRESHOLD ? "present" : "silent", secs);
     st = OutputStats{};
     st.window_start_us = now;
 }
