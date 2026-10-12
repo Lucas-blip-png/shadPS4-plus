@@ -13,11 +13,15 @@
 
 #include <miniz.h>
 
+#include <algorithm>
+#include <array>
+#include <charconv>
 #include <condition_variable>
 #include <functional>
 #include <future>
 #include <mutex>
 #include <queue>
+#include <string_view>
 
 namespace {
 
@@ -116,8 +120,66 @@ void DataBase::Open() {
         }
     }
 
+    ScanShaderBinaryIndices();
     io_worker = std::jthread{ProcessIO};
     opened = true;
+}
+
+void DataBase::ScanShaderBinaryIndices() {
+    // Shader binaries are stored as <pgm_hash as {:#018x}>_<permutation index>.spv
+    const auto add = [this](std::string_view name) {
+        if (!name.ends_with(".spv") || !name.starts_with("0x")) {
+            return;
+        }
+        name.remove_suffix(4);
+        const auto sep = name.rfind('_');
+        if (sep == std::string_view::npos) {
+            return;
+        }
+        u64 hash{};
+        u32 index{};
+        const auto hash_part = name.substr(2, sep - 2);
+        const auto index_part = name.substr(sep + 1);
+        const auto [hash_end, hash_ec] =
+            std::from_chars(hash_part.data(), hash_part.data() + hash_part.size(), hash, 16);
+        const auto [index_end, index_ec] =
+            std::from_chars(index_part.data(), index_part.data() + index_part.size(), index);
+        if (hash_ec != std::errc{} || hash_end != hash_part.data() + hash_part.size() ||
+            index_ec != std::errc{} || index_end != index_part.data() + index_part.size()) {
+            return;
+        }
+        auto& next = next_binary_index[hash];
+        next = std::max(next, index + 1);
+    };
+    next_binary_index.clear();
+    if (EmulatorSettings.IsPipelineCacheArchived()) {
+        const auto num_files = mz_zip_reader_get_num_files(&zip_ar);
+        for (u32 index = 0; index < num_files; ++index) {
+            std::array<char, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE> file_name{};
+            mz_zip_reader_get_filename(&zip_ar, index, file_name.data(), file_name.size());
+            add(file_name.data());
+        }
+    } else {
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator{cache_path, ec}) {
+            add(entry.path().filename().string());
+        }
+    }
+}
+
+u32 DataBase::AllocateShaderBinaryIndex(u64 pgm_hash, u32 min_index) {
+    if (!opened) {
+        return min_index;
+    }
+    std::scoped_lock lk{index_mutex};
+    auto& next = next_binary_index[pgm_hash];
+    const u32 index = std::max(next, min_index);
+    if (index != min_index) {
+        LOG_WARNING(Render, "Shader cache: new permutation of {:#x} stored at index {} instead of {}",
+                    pgm_hash, index, min_index);
+    }
+    next = index + 1;
+    return index;
 }
 
 void DataBase::Close() {

@@ -167,6 +167,9 @@ private:
     /// dynamic_tsharp_array_size: logs the first descriptor array bound, then a per-minute count
     void ReportTsharpArray(u64 pgm_hash, u32 num_elements, u32 null_elements);
     bool BindResources(const Pipeline* pipeline);
+    /// Sets each sampled image descriptor's layout to the one its subresource is in after the
+    /// last transition of the command.
+    void RefreshImageDescriptorLayouts();
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);
@@ -475,6 +478,15 @@ private:
     static constexpr u32 MaxImageDescriptors =
         Shader::NUM_IMAGES + Shader::NUM_IMAGE_ARRAY_DESCRIPTORS;
     boost::container::static_vector<vk::DescriptorImageInfo, MaxImageDescriptors> image_infos;
+    // Sampled image descriptors of the current bind, for RefreshImageDescriptorLayouts. The
+    // backing is kept by index: adding a backing can move the others.
+    struct ImageDescriptorRef {
+        u32 info_index;
+        VideoCore::ImageId image_id;
+        u32 backing_index;
+        u32 subres_idx;
+    };
+    boost::container::static_vector<ImageDescriptorRef, MaxImageDescriptors> image_descriptor_refs;
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;
         u64 offset;

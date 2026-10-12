@@ -257,6 +257,13 @@ public:
         SmallVector<ViewRecord, 2> view_records;
         SmallVector<ImageViewId, 2> image_view_ids;
         u32 num_samples;
+
+        /// Layout of one subresource (mip * layers + layer). After a partial
+        /// transition `state` holds the last range transitioned, not this one.
+        [[nodiscard]] vk::ImageLayout Layout(u32 subres_idx) const {
+            return subres_idx < subresource_states.size() ? subresource_states[subres_idx].layout
+                                                          : state.layout;
+        }
     };
     SmallVector<BackingImage, 2> backing_images;
     BackingImage* backing{};

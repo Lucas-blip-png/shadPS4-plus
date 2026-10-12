@@ -65,7 +65,7 @@ struct Buffer {
             .b = CompSwizzle(dst_sel_z),
             .a = CompSwizzle(dst_sel_w),
         };
-        return RemapSwizzle(DataFormat(data_format), dst_sel);
+        return RemapSwizzle(DataFormat(data_format), dst_sel.Normalized());
     }
 
     NumberFormat GetNumberFmt() const noexcept {
@@ -216,7 +216,7 @@ struct Image {
             .b = CompSwizzle(dst_sel_z),
             .a = CompSwizzle(dst_sel_w),
         };
-        return RemapSwizzle(DataFormat(data_format), dst_sel);
+        return RemapSwizzle(DataFormat(data_format), dst_sel.Normalized());
     }
 
     u32 Pitch() const {
