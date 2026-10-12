@@ -20,6 +20,7 @@
 #include "core/libraries/ngs2/ngs2_error.h"
 #include "core/libraries/ngs2/ngs2_geom.h"
 #include "core/libraries/ngs2/ngs2_impl.h"
+#include "core/libraries/ngs2/ngs2_mixer.h"
 #include "core/libraries/ngs2/ngs2_pan.h"
 #include "core/libraries/ngs2/ngs2_report.h"
 #include "core/libraries/ngs2/ngs2_sampler.h"
@@ -85,6 +86,9 @@ OrbisNgs2Handle FakeVoiceHandle(OrbisNgs2Handle rackHandle, u32 voiceIndex) {
 }
 
 std::string DescribeVoice(OrbisNgs2Handle voice) {
+    if (Mixer::IsEnabled()) {
+        return Mixer::DescribeVoice(voice);
+    }
     const u64 rack_index = voice >> 24;
     const u64 voice_index = ((voice >> 4) & 0xFFFFF);
     std::scoped_lock lock{diag_mutex};
@@ -157,8 +161,8 @@ void MaybeLogSummary() {
                  "SystemRender calls={} (+{}) racks={} paramIds={{{} }}",
                  vc, vc - prev_voice_control_calls,
                  voice_control_params.load(std::memory_order_relaxed), gs,
-                 gs - prev_voice_get_state_calls, rc, rc - prev_render_calls, rack_records.size(),
-                 ids);
+                 gs - prev_voice_get_state_calls, rc, rc - prev_render_calls,
+                 Mixer::IsEnabled() ? Mixer::RackCount() : rack_records.size(), ids);
         prev_voice_control_calls = vc;
         prev_voice_get_state_calls = gs;
         prev_render_calls = rc;
@@ -300,6 +304,12 @@ s32 PS4_SYSV_ABI sceNgs2RackCreate(OrbisNgs2Handle systemHandle, u32 rackId,
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
     }
+    if (Mixer::IsEnabled()) {
+        const s32 result = Mixer::RackCreate(systemHandle, rackId, option, bufferInfo, outHandle);
+        LOG_INFO(Lib_Ngs2, "sceNgs2RackCreate: rackId={:#x} -> result {:#x} rack handle {:#x}",
+                 rackId, static_cast<u32>(result), result >= 0 && outHandle ? *outHandle : 0);
+        return result;
+    }
     if (outHandle) {
         *outHandle = NewFakeRackHandle(rackId, option ? option->maxVoices : 0);
         LOG_INFO(Lib_Ngs2, "sceNgs2RackCreate: rackId={:#x} -> fake rack handle {:#x}", rackId,
@@ -317,6 +327,14 @@ s32 PS4_SYSV_ABI sceNgs2RackCreateWithAllocator(OrbisNgs2Handle systemHandle, u3
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
     }
+    if (Mixer::IsEnabled()) {
+        const s32 result =
+            Mixer::RackCreateWithAllocator(systemHandle, rackId, option, allocator, outHandle);
+        LOG_INFO(Lib_Ngs2,
+                 "sceNgs2RackCreateWithAllocator: rackId={:#x} -> result {:#x} rack handle {:#x}",
+                 rackId, static_cast<u32>(result), result >= 0 && outHandle ? *outHandle : 0);
+        return result;
+    }
     if (outHandle) {
         *outHandle = NewFakeRackHandle(rackId, option ? option->maxVoices : 0);
         LOG_INFO(Lib_Ngs2, "sceNgs2RackCreateWithAllocator: rackId={:#x} -> fake rack handle {:#x}",
@@ -327,6 +345,9 @@ s32 PS4_SYSV_ABI sceNgs2RackCreateWithAllocator(OrbisNgs2Handle systemHandle, u3
 
 s32 PS4_SYSV_ABI sceNgs2RackDestroy(OrbisNgs2Handle rackHandle,
                                     OrbisNgs2ContextBufferInfo* outBufferInfo) {
+    if (Mixer::IsEnabled()) {
+        return Mixer::RackDestroy(rackHandle, outBufferInfo);
+    }
     LOG_ERROR(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
@@ -338,12 +359,27 @@ s32 PS4_SYSV_ABI sceNgs2RackGetInfo(OrbisNgs2Handle rackHandle, OrbisNgs2RackInf
 }
 
 s32 PS4_SYSV_ABI sceNgs2RackGetUserData(OrbisNgs2Handle rackHandle, uintptr_t* outUserData) {
+    if (Mixer::IsEnabled()) {
+        return Mixer::RackGetUserData(rackHandle, outUserData);
+    }
     LOG_ERROR(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2RackGetVoiceHandle(OrbisNgs2Handle rackHandle, u32 voiceIndex,
                                            OrbisNgs2Handle* outHandle) {
+    if (Mixer::IsEnabled()) {
+        const s32 result = Mixer::RackGetVoiceHandle(rackHandle, voiceIndex, outHandle);
+        static std::atomic<u32> mixer_logged{0};
+        if (mixer_logged.load(std::memory_order_relaxed) < 64 && DiagEnabled()) {
+            mixer_logged.fetch_add(1, std::memory_order_relaxed);
+            LOG_INFO(Lib_Ngs2,
+                     "sceNgs2RackGetVoiceHandle: rack={:#x} voiceIndex={} -> result {:#x} {:#x}",
+                     rackHandle, voiceIndex, static_cast<u32>(result),
+                     result >= 0 && outHandle ? *outHandle : 0);
+        }
+        return result;
+    }
     if (outHandle) {
         *outHandle = FakeVoiceHandle(rackHandle, voiceIndex);
     }
@@ -357,6 +393,9 @@ s32 PS4_SYSV_ABI sceNgs2RackGetVoiceHandle(OrbisNgs2Handle rackHandle, u32 voice
 }
 
 s32 PS4_SYSV_ABI sceNgs2RackLock(OrbisNgs2Handle rackHandle) {
+    if (Mixer::IsEnabled()) {
+        return Mixer::RackLock(rackHandle);
+    }
     LOG_DEBUG(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
@@ -364,15 +403,24 @@ s32 PS4_SYSV_ABI sceNgs2RackLock(OrbisNgs2Handle rackHandle) {
 s32 PS4_SYSV_ABI sceNgs2RackQueryBufferSize(u32 rackId, const OrbisNgs2RackOption* option,
                                             OrbisNgs2ContextBufferInfo* outBufferInfo) {
     LogRackOption("sceNgs2RackQueryBufferSize", rackId, option);
+    if (Mixer::IsEnabled()) {
+        return Mixer::RackQueryBufferSize(rackId, option, outBufferInfo);
+    }
     return RackQueryBufferSize(option, outBufferInfo);
 }
 
 s32 PS4_SYSV_ABI sceNgs2RackSetUserData(OrbisNgs2Handle rackHandle, uintptr_t userData) {
+    if (Mixer::IsEnabled()) {
+        return Mixer::RackSetUserData(rackHandle, userData);
+    }
     LOG_ERROR(Lib_Ngs2, "userData = {}", userData);
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2RackUnlock(OrbisNgs2Handle rackHandle) {
+    if (Mixer::IsEnabled()) {
+        return Mixer::RackUnlock(rackHandle);
+    }
     LOG_DEBUG(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
@@ -383,6 +431,9 @@ s32 PS4_SYSV_ABI sceNgs2SystemCreate(const OrbisNgs2SystemOption* option,
     s32 result;
     OrbisNgs2ContextBufferInfo localInfo;
     LogSystemOption("sceNgs2SystemCreate", option);
+    if (Mixer::IsEnabled()) {
+        return Mixer::SystemCreate(option, bufferInfo, outHandle);
+    }
     if (!bufferInfo || !outHandle) {
         if (!bufferInfo) {
             result = ORBIS_NGS2_ERROR_INVALID_BUFFER_INFO;
@@ -416,6 +467,9 @@ s32 PS4_SYSV_ABI sceNgs2SystemCreateWithAllocator(const OrbisNgs2SystemOption* o
                                                   OrbisNgs2Handle* outHandle) {
     s32 result;
     LogSystemOption("sceNgs2SystemCreateWithAllocator", option);
+    if (Mixer::IsEnabled()) {
+        return Mixer::SystemCreateWithAllocator(option, allocator, outHandle);
+    }
     if (allocator && allocator->allocHandler != 0) {
         OrbisNgs2BufferAllocHandler hostAlloc = allocator->allocHandler;
         if (outHandle) {
@@ -453,6 +507,9 @@ s32 PS4_SYSV_ABI sceNgs2SystemDestroy(OrbisNgs2Handle systemHandle,
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
     }
+    if (Mixer::IsEnabled()) {
+        return Mixer::SystemDestroy(systemHandle, outBufferInfo);
+    }
     LOG_INFO(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
@@ -483,6 +540,9 @@ s32 PS4_SYSV_ABI sceNgs2SystemGetUserData(OrbisNgs2Handle systemHandle, uintptr_
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
     }
+    if (Mixer::IsEnabled()) {
+        return Mixer::SystemGetUserData(systemHandle, outUserData);
+    }
     LOG_DEBUG(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
@@ -491,6 +551,9 @@ s32 PS4_SYSV_ABI sceNgs2SystemLock(OrbisNgs2Handle systemHandle) {
     if (!systemHandle) {
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+    }
+    if (Mixer::IsEnabled()) {
+        return Mixer::SystemLock(systemHandle);
     }
     LOG_DEBUG(Lib_Ngs2, "called");
     return ORBIS_OK;
@@ -518,10 +581,13 @@ s32 PS4_SYSV_ABI sceNgs2SystemRender(OrbisNgs2Handle systemHandle,
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
     }
-    // Nothing is rendered: the guest buffers are left untouched
     if (DiagEnabled()) {
         DiagRender(systemHandle, aBufferInfo, numBufferInfo);
     }
+    if (Mixer::IsEnabled()) {
+        return Mixer::SystemRender(systemHandle, aBufferInfo, numBufferInfo);
+    }
+    // Nothing is rendered: the guest buffers are left untouched
     return ORBIS_OK;
 }
 
@@ -545,6 +611,9 @@ s32 PS4_SYSV_ABI sceNgs2SystemSetGrainSamples(OrbisNgs2Handle systemHandle, u32 
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
     }
+    if (Mixer::IsEnabled()) {
+        return Mixer::SystemSetGrainSamples(systemHandle, numSamples);
+    }
     return ORBIS_OK;
 }
 
@@ -553,6 +622,9 @@ s32 PS4_SYSV_ABI sceNgs2SystemSetSampleRate(OrbisNgs2Handle systemHandle, u32 sa
     if (!systemHandle) {
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
+    }
+    if (Mixer::IsEnabled()) {
+        return Mixer::SystemSetSampleRate(systemHandle, sampleRate);
     }
     return ORBIS_OK;
 }
@@ -563,6 +635,9 @@ s32 PS4_SYSV_ABI sceNgs2SystemSetUserData(OrbisNgs2Handle systemHandle, uintptr_
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
     }
+    if (Mixer::IsEnabled()) {
+        return Mixer::SystemSetUserData(systemHandle, userData);
+    }
     return ORBIS_OK;
 }
 
@@ -571,15 +646,21 @@ s32 PS4_SYSV_ABI sceNgs2SystemUnlock(OrbisNgs2Handle systemHandle) {
         LOG_ERROR(Lib_Ngs2, "systemHandle is nullptr");
         return ORBIS_NGS2_ERROR_INVALID_SYSTEM_HANDLE;
     }
+    if (Mixer::IsEnabled()) {
+        return Mixer::SystemUnlock(systemHandle);
+    }
     LOG_DEBUG(Lib_Ngs2, "called");
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2VoiceControl(OrbisNgs2Handle voiceHandle,
                                      const OrbisNgs2VoiceParamHeader* paramList) {
-    // Hot path (per audio grain). Params are not applied yet, only logged at Info for diagnosis.
+    // Hot path (per audio grain). Logged at Info for diagnosis; applied only by the software mixer.
     if (DiagEnabled()) {
         DiagVoiceControl(voiceHandle, paramList);
+    }
+    if (Mixer::IsEnabled()) {
+        return Mixer::VoiceControl(voiceHandle, paramList);
     }
     return ORBIS_OK;
 }
@@ -604,14 +685,20 @@ s32 PS4_SYSV_ABI sceNgs2VoiceGetPortInfo(OrbisNgs2Handle voiceHandle, u32 port,
 
 s32 PS4_SYSV_ABI sceNgs2VoiceGetState(OrbisNgs2Handle voiceHandle, OrbisNgs2VoiceState* outState,
                                       size_t stateSize) {
-    // Polled every audio grain by SotC; stays quiet. The state is not written (no voice emulation)
+    // Polled every audio grain by SotC; stays quiet. Only the software mixer writes the state
     LOG_DEBUG(Lib_Ngs2, "stateSize = {}", stateSize);
     voice_get_state_calls.fetch_add(1, std::memory_order_relaxed);
     MaybeLogSummary();
+    if (Mixer::IsEnabled()) {
+        return Mixer::VoiceGetState(voiceHandle, outState, stateSize);
+    }
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNgs2VoiceGetStateFlags(OrbisNgs2Handle voiceHandle, u32* outStateFlags) {
+    if (Mixer::IsEnabled()) {
+        return Mixer::VoiceGetStateFlags(voiceHandle, outStateFlags);
+    }
     // Report an idle voice instead of leaving the caller's variable uninitialized
     if (outStateFlags) {
         *outStateFlags = 0;

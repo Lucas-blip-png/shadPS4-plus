@@ -404,6 +404,7 @@ struct AudioSettings {
     Setting<std::string> openal_padSpk_output_device{"Default Device"};
     Setting<u32> openal_hrtf{OpenALHrtfMode::HrtfAuto};
     Setting<u32> openal_output_mode{OpenALOutputMode::OutputAuto};
+    Setting<bool> ngs2_software_mixer{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -419,14 +420,17 @@ struct AudioSettings {
             make_override<AudioSettings>("openal_padSpk_output_device",
                                          &AudioSettings::openal_padSpk_output_device),
             make_override<AudioSettings>("openal_hrtf", &AudioSettings::openal_hrtf),
-            make_override<AudioSettings>("openal_output_mode", &AudioSettings::openal_output_mode)};
+            make_override<AudioSettings>("openal_output_mode", &AudioSettings::openal_output_mode),
+            make_override<AudioSettings>("ngs2_software_mixer",
+                                         &AudioSettings::ngs2_software_mixer)};
     }
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
                                    sdl_main_output_device, sdl_padSpk_output_device,
                                    openal_mic_device, openal_main_output_device,
-                                   openal_padSpk_output_device, openal_hrtf, openal_output_mode)
+                                   openal_padSpk_output_device, openal_hrtf, openal_output_mode,
+                                   ngs2_software_mixer)
 
 // -------------------------------
 // GPU settings
@@ -1223,6 +1227,7 @@ public:
     SETTING_FORWARD(m_audio, OpenALPadSpkOutputDevice, openal_padSpk_output_device)
     SETTING_FORWARD(m_audio, OpenALHrtf, openal_hrtf)
     SETTING_FORWARD(m_audio, OpenALOutputMode, openal_output_mode)
+    SETTING_FORWARD_BOOL(m_audio, Ngs2SoftwareMixer, ngs2_software_mixer)
 
     // Debug settings
     SETTING_FORWARD_BOOL(m_debug, DebugDump, debug_dump)
