@@ -28,6 +28,7 @@ constexpr u32 LdsBarriersLargeGroupsBit = 46;
 u64 CodegenSettingsKey() {
     return u64{EmulatorSettings.GetComputeLoopCap()} |
            (u64{EmulatorSettings.IsLdsBarrierUniformReadlane()} << 33) |
+           (u64{EmulatorSettings.IsEarlyFragmentTestsFromZOrder()} << 34) |
            (u64{EmulatorSettings.IsWave64UniformBranches()} << 42) |
            (u64{EmulatorSettings.IsWave64MissingLaneIdentity()} << 45) |
            (u64{EmulatorSettings.IsLdsBarriersLargeGroups()} << LdsBarriersLargeGroupsBit);

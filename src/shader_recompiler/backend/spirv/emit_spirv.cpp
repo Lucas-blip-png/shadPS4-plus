@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <mutex>
 #include <span>
 #include <type_traits>
@@ -481,6 +482,18 @@ void DefineEntryPoint(const Info& info, const RuntimeInfo& runtime_info, EmitCon
         if (runtime_info.hw.fs.depth_before_shader) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::EarlyFragmentTests);
             ASSERT_MSG(!stores_depth, "DEPTH_BEFORE_SHADER enabled with depth exporting shader");
+        } else if (runtime_info.hw.fs.early_fragment_tests && info.has_storage_images &&
+                   !info.has_discard && !info.stores.GetAny(IR::Attribute::Depth) &&
+                   !info.stores.Get(IR::Attribute::StencilRef) &&
+                   !info.stores.Get(IR::Attribute::SampleMask)) {
+            // Only for shaders whose side effects depend on it: storage writes, and nothing that early
+            // tests would change (discard, or a depth, stencil ref or sample mask export)
+            ctx.AddExecutionMode(main, spv::ExecutionMode::EarlyFragmentTests);
+            static std::atomic<u32> early_tests_shaders{0};
+            LOG_WARNING(Render_Recompiler,
+                        "Workaround early_fragment_tests_from_z_order: fs {:#x} runs depth/stencil "
+                        "tests before its storage writes (affected shaders: {})",
+                        info.pgm_hash, early_tests_shaders.fetch_add(1) + 1);
         }
         break;
     }

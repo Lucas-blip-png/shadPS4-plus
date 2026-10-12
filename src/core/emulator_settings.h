@@ -744,6 +744,8 @@ struct GPUSettings {
     // Per-game loop limit (0 = off): stop runaway compute shaders after this many back edges
     // Shadow of the Colossus uses 1048576 to avoid a GPU timeout
     Setting<u32> compute_loop_cap{0};
+    // Add EarlyFragmentTests to storage-writing pixel shaders when the guest runs depth/stencil first
+    Setting<bool> early_fragment_tests_from_z_order{false};
 
 #define GPU_OVERRIDE(field) make_override<GPUSettings>(#field, &GPUSettings::field)
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -846,6 +848,7 @@ struct GPUSettings {
             GPU_OVERRIDE(lds_barrier_uniform_readlane),
             GPU_OVERRIDE(lds_barriers_large_groups),
             GPU_OVERRIDE(compute_loop_cap),
+            GPU_OVERRIDE(early_fragment_tests_from_z_order),
         };
     }
 #undef GPU_OVERRIDE
@@ -881,7 +884,7 @@ struct GPUSettings {
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
     clean_sync_peek, readback_offload, real_occlusion_queries, threaded_cmd_recording, compute_fast_compile, compute_fast_compile_force, readback_transfer_queue, \
     wave64_uniform_branches, wave64_missing_lane_identity, lds_barrier_uniform_readlane, \
-    lds_barriers_large_groups, compute_loop_cap
+    lds_barriers_large_groups, compute_loop_cap, early_fragment_tests_from_z_order
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1294,6 +1297,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, LdsBarrierUniformReadlane, lds_barrier_uniform_readlane)
     SETTING_FORWARD_BOOL(m_gpu, LdsBarriersLargeGroups, lds_barriers_large_groups)
     SETTING_FORWARD(m_gpu, ComputeLoopCap, compute_loop_cap)
+    SETTING_FORWARD_BOOL(m_gpu, EarlyFragmentTestsFromZOrder, early_fragment_tests_from_z_order)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {
