@@ -58,6 +58,9 @@ struct InfoPersistent {
     bool has_fetch_shader{};
     bool has_bitwise_xor{};
     bool uses_dma{};
+    /// compute_loop_cap: back-edge budget per invocation, 0 = unlimited
+    bool uses_loop_cap{};
+    u32 loop_cap{};
 
     InfoPersistent() = default;
     InfoPersistent(HwStage hw_stage_, SwStage sw_stage_, u64 pgm_hash_)

@@ -837,6 +837,9 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
     case BufferType::SharedMemory:
         Name(id, "ssbo_shmem");
         break;
+    case BufferType::LoopCapBuffer:
+        Name(id, "loop_cap_buffer");
+        break;
     default:
         Name(id, fmt::format("ssbo_{}", binding.buffer));
         break;
@@ -860,6 +863,8 @@ void EmitContext::DefineBuffers() {
             bda_pagetable_index = buffers.size();
         } else if (desc.buffer_type == BufferType::FaultBuffer) {
             fault_buffer_index = buffers.size();
+        } else if (desc.buffer_type == BufferType::LoopCapBuffer) {
+            loop_cap_buffer_index = buffers.size();
         }
 
         // Define aliases depending on the shader usage.

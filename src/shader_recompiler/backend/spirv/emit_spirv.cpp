@@ -152,8 +152,37 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
     }
 }
 
+/// Records a compute_loop_cap hit before returning: loop_cap_buffer[0] counts invocations that reached the
+/// cap and loop_cap_buffer[1] keeps the low bits of the last shader hash
+void EmitLoopCapReport(EmitContext& ctx, Id loop_watchdog, u32 limit) {
+    const Id hit_label{ctx.OpLabel()};
+    const Id merge_label{ctx.OpLabel()};
+    const Id count{ctx.OpLoad(ctx.U32[1], loop_watchdog)};
+    // The comparison must be emitted before OpSelectionMerge, which has to directly precede the branch
+    const Id capped{ctx.OpUGreaterThanEqual(ctx.U1[1], count, ctx.ConstU32(limit))};
+    ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(capped, hit_label, merge_label);
+    ctx.AddLabel(hit_label);
+    const auto [buffer_id, pointer_type] =
+        ctx.buffers[ctx.loop_cap_buffer_index].Alias(EmitContext::PointerType::U32);
+    const Id device_scope{ctx.ConstU32(static_cast<u32>(spv::Scope::Device))};
+    const Id hits_ptr{
+        ctx.OpAccessChain(pointer_type, buffer_id, ctx.u32_zero_value, ctx.u32_zero_value)};
+    ctx.OpAtomicIAdd(ctx.U32[1], hits_ptr, device_scope, ctx.u32_zero_value, ctx.ConstU32(1U));
+    const Id hash_ptr{
+        ctx.OpAccessChain(pointer_type, buffer_id, ctx.u32_zero_value, ctx.ConstU32(1U))};
+    ctx.OpAtomicExchange(ctx.U32[1], hash_ptr, device_scope, ctx.u32_zero_value,
+                         ctx.ConstU32(static_cast<u32>(ctx.info.pgm_hash)));
+    ctx.OpBranch(merge_label);
+    ctx.AddLabel(merge_label);
+}
+
 void Traverse(EmitContext& ctx, const IR::Program& program) {
     IR::Block* current_block{};
+    // compute_loop_cap: one private back-edge counter per invocation, shared by all its loops. Reaching the
+    // cap leaves the loop, turning a runaway guest loop (GPU TDR) into one wrong dispatch
+    Id loop_watchdog{};
+    const u32 loop_limit = ctx.info.uses_loop_cap ? ctx.info.loop_cap : 0;
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
         case IR::AbstractSyntaxNode::Type::Block: {
@@ -198,12 +227,28 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             break;
         case IR::AbstractSyntaxNode::Type::Repeat: {
             Id cond{ctx.Def(node.data.repeat.cond)};
+            if (loop_limit != 0) {
+                if (!Sirit::ValidId(loop_watchdog)) {
+                    const Id type{ctx.TypePointer(spv::StorageClass::Private, ctx.U32[1])};
+                    loop_watchdog = ctx.AddGlobalVariable(type, spv::StorageClass::Private,
+                                                          ctx.u32_zero_value);
+                    ctx.interfaces.push_back(loop_watchdog);
+                }
+                const Id count{ctx.OpIAdd(ctx.U32[1], ctx.OpLoad(ctx.U32[1], loop_watchdog),
+                                          ctx.ConstU32(1U))};
+                ctx.OpStore(loop_watchdog, count);
+                cond = ctx.OpLogicalAnd(ctx.U1[1], cond,
+                                        ctx.OpULessThan(ctx.U1[1], count, ctx.ConstU32(loop_limit)));
+            }
             const Id loop_header_label{node.data.repeat.loop_header->Definition<Id>()};
             const Id merge_label{node.data.repeat.merge->Definition<Id>()};
             ctx.OpBranchConditional(cond, loop_header_label, merge_label);
             break;
         }
         case IR::AbstractSyntaxNode::Type::Return:
+            if (loop_limit != 0 && Sirit::ValidId(loop_watchdog)) {
+                EmitLoopCapReport(ctx, loop_watchdog, loop_limit);
+            }
             ctx.OpReturn();
             break;
         case IR::AbstractSyntaxNode::Type::Unreachable:

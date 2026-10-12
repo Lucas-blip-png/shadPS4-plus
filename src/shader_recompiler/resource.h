@@ -106,6 +106,7 @@ enum class BufferType : u8 {
     GdsBuffer,
     SharedMemory,
     ClipPlanes,
+    LoopCapBuffer,
 };
 
 struct BufferResource {

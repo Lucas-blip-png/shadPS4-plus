@@ -2111,6 +2111,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const auto* fault_buffer = buffer_cache.GetFaultBuffer();
                 buffer_infos[info_n++] =
                     vk::DescriptorBufferInfo{fault_buffer->Handle(), 0, fault_buffer->SizeBytes()};
+            } else if (desc.buffer_type == Shader::BufferType::LoopCapBuffer) {
+                const auto* loop_cap_buffer = buffer_cache.GetLoopCapBuffer();
+                buffer_infos[info_n++] = vk::DescriptorBufferInfo{
+                    loop_cap_buffer->Handle(), 0, loop_cap_buffer->SizeBytes()};
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = liverpool->GetCsRegs();
