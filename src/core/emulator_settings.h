@@ -537,6 +537,8 @@ struct GPUSettings {
     // Guest readbacks go on a transfer-only queue and wait only for the in-flight batch that last
     // wrote the range, instead of submitting the open batch.
     Setting<bool> readback_transfer_queue{false};
+    // Guest thread and fiber stacks stay writable and are never written by GPU readbacks.
+    Setting<bool> cpu_authoritative_stacks{false};
     // Flush the graphics command buffer every this many draws (0 = only at
     // submit-done and faults). A guest readback then waits on a command
     // buffer holding at most this many draws instead of the whole recorded
@@ -778,6 +780,7 @@ struct GPUSettings {
             GPU_OVERRIDE(compute_fast_compile),
             GPU_OVERRIDE(compute_fast_compile_force),
             GPU_OVERRIDE(readback_transfer_queue),
+            GPU_OVERRIDE(cpu_authoritative_stacks),
             GPU_OVERRIDE(flush_draw_interval),
             GPU_OVERRIDE(pipeline_key_stamp_reuse),
             GPU_OVERRIDE(shader_params_memo),
@@ -862,7 +865,8 @@ struct GPUSettings {
     runtime_info_stamp_gate, userfaultfd, gpu_thread_core_reserve, one_thread_per_core, \
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
-    clean_sync_peek, readback_offload, real_occlusion_queries, threaded_cmd_recording, compute_fast_compile, compute_fast_compile_force, readback_transfer_queue
+    clean_sync_peek, readback_offload, real_occlusion_queries, threaded_cmd_recording, compute_fast_compile, compute_fast_compile_force, readback_transfer_queue, \
+    cpu_authoritative_stacks
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1203,6 +1207,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ComputeFastCompile, compute_fast_compile)
     SETTING_FORWARD_BOOL(m_gpu, ComputeFastCompileForce, compute_fast_compile_force)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackTransferQueue, readback_transfer_queue)
+    SETTING_FORWARD_BOOL(m_gpu, CpuAuthoritativeStacks, cpu_authoritative_stacks)
     SETTING_FORWARD(m_gpu, FlushDrawInterval, flush_draw_interval)
     SETTING_FORWARD_BOOL(m_gpu, PipelineKeyStampReuse, pipeline_key_stamp_reuse)
     SETTING_FORWARD_BOOL(m_gpu, ShaderParamsMemo, shader_params_memo)

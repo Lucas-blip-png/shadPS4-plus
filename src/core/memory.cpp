@@ -1854,4 +1854,43 @@ MemoryManager::PhysHandle MemoryManager::Split(PhysMap& map, PhysHandle phys_han
     return map.emplace_hint(std::next(phys_handle), new_area.base, new_area);
 }
 
+// Host page protection is page granular, so a stack that is not page aligned (fiber contexts are
+// carved out of the heap) must exclude the whole pages it touches
+static constexpr u64 StackPageSize = 4_KB;
+
+void MemoryManager::RegisterStackRange(VAddr virtual_addr, u64 size) {
+    if (size == 0 || !EmulatorSettings.IsCpuAuthoritativeStacks()) {
+        return;
+    }
+    const VAddr start = Common::AlignDown(virtual_addr, StackPageSize);
+    const VAddr end = Common::AlignUp(virtual_addr + size, StackPageSize);
+    stack_ranges.Add(start, end);
+    // The range may already be write-protected by GPU memory tracking (e.g. a fiber context carved
+    // out of a heap that the GPU also reads). Restore write access right away: tracking faults can
+    // never be delivered on a read-only stack page
+    std::shared_lock lk{mutex};
+    if (IsValidMapping(start, end - start)) {
+        impl.Protect(start, end - start, MemoryPermission::ReadWrite);
+    }
+}
+
+void MemoryManager::UnregisterStackRange(VAddr virtual_addr, u64 size) {
+    if (size == 0 || !stack_ranges.HasRanges()) {
+        return;
+    }
+    // Same page rounding as RegisterStackRange: the counts keep pages shared with another live
+    // stack excluded
+    const VAddr start = Common::AlignDown(virtual_addr, StackPageSize);
+    const VAddr end = Common::AlignUp(virtual_addr + size, StackPageSize);
+    stack_ranges.Remove(start, end);
+    // The game reuses the memory (e.g. as allocator metadata of a fiber heap). Hand the parts that
+    // are no longer any stack back to normal tracking as CPU-modified, so no stale GPU data is ever
+    // downloaded over them
+    if (rasterizer) {
+        for (const auto& [lo, len] : SubtractStackRanges(start, end - start)) {
+            rasterizer->ReleaseCpuAuthoritativeRange(lo, len);
+        }
+    }
+}
+
 } // namespace Core

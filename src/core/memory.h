@@ -13,6 +13,7 @@
 #include "common/types.h"
 #include "core/address_space.h"
 #include "core/libraries/kernel/memory.h"
+#include "core/stack_ranges.h"
 
 namespace Vulkan {
 class Rasterizer;
@@ -319,6 +320,24 @@ public:
     /// Returns and resets the calling thread's backing write memo counters.
     static BackingWriteStats DrainBackingWriteStats();
 
+    using StackPieces = StackRangeSet::Pieces;
+
+    /// Keep guest thread and fiber stacks writable when cpu_authoritative_stacks is enabled.
+    /// The host OS cannot dispatch faults raised while pushing to a protected stack page.
+    void RegisterStackRange(VAddr virtual_addr, u64 size);
+    void UnregisterStackRange(VAddr virtual_addr, u64 size);
+    bool OverlapsStackRange(VAddr virtual_addr, u64 size) const {
+        return stack_ranges.Overlaps(virtual_addr, size);
+    }
+    /// Returns the parts of [virtual_addr, virtual_addr + size) that are not stack memory.
+    StackPieces SubtractStackRanges(VAddr virtual_addr, u64 size) const {
+        return stack_ranges.Subtract(virtual_addr, size);
+    }
+    /// Returns the parts of [virtual_addr, virtual_addr + size) that are stack memory.
+    StackPieces GetStackRangesIn(VAddr virtual_addr, u64 size) const {
+        return stack_ranges.GetIn(virtual_addr, size);
+    }
+
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
     PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment);
@@ -429,6 +448,7 @@ private:
     u64 pool_budget{};
     s32 sdk_version{};
     Vulkan::Rasterizer* rasterizer{};
+    StackRangeSet stack_ranges;
 
     struct PrtArea {
         VAddr start;

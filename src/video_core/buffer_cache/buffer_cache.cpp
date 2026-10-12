@@ -119,6 +119,15 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     });
 }
 
+void BufferCache::ReleaseCpuAuthoritativeRange(VAddr device_addr, u64 size) {
+    // A released stack range goes back to normal tracking as CPU-modified: whatever the GPU wrote
+    // there before it became a stack is stale
+    liverpool->SendCommand([this, device_addr, size] {
+        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, true);
+        gpu_modified_ranges.Subtract(device_addr, size);
+    });
+}
+
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
     if (readback_offload && !assume_locks && OffloadReadback(device_addr, size, is_write)) {
         return;
@@ -165,10 +174,27 @@ u64 BufferCache::CollectDownloads(const Buffer* arena, VAddr device_addr, u64 si
             constexpr u64 mask = ~(align - 1ULL);
             total_size_bytes += (new_size + align - 1) & mask;
         };
-        gpu_modified_ranges.ForEachInRange(address, size, add_download);
+        // Stack pages are CPU-authoritative (cpu_authoritative_stacks): never download over them
+        gpu_modified_ranges.ForEachInRange(address, size, [&](VAddr start, VAddr end) {
+            for (const auto& [lo, len] : memory->SubtractStackRanges(start, end - start)) {
+                add_download(lo, lo + len);
+            }
+        });
         gpu_modified_ranges.Subtract(address, size);
     });
     return total_size_bytes;
+}
+
+void BufferCache::WriteBackDownloads(VAddr arena_base, const DownloadCopies& copies,
+                                     const u8* mapped, u64 staging_offset) {
+    for (const auto& copy : copies) {
+        const VAddr copy_addr = arena_base + copy.srcOffset;
+        const u8* src = mapped + (copy.dstOffset - staging_offset);
+        // A page can become a stack while the GPU drains: subtract the stacks again
+        for (const auto& [lo, len] : memory->SubtractStackRanges(copy_addr, copy.size)) {
+            memory->TryWriteBacking(std::bit_cast<u8*>(lo), src + (lo - copy_addr), len);
+        }
+    }
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
@@ -192,11 +218,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     scheduler.Finish();
 
     download.buffer->Invalidate(download.offset, download.size);
-    for (const auto& copy : copies) {
-        auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
-        memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
-                                copy.size);
-    }
+    WriteBackDownloads(arena_base, copies, download.mapped, download.offset);
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
 }
 
@@ -382,11 +404,7 @@ void BufferCache::FinishReadback(const Readback& job) {
     job.staging.Invalidate();
     // The write-back runs ahead of the verdict: other downloads of the window wait while this one
     // is pending, and a vetoed window stays GPU modified.
-    for (const auto& copy : job.copies) {
-        auto* dst_addr = std::bit_cast<u8*>(job.arena_base + copy.srcOffset);
-        memory->TryWriteBacking(
-            dst_addr, job.staging.mapped + (copy.dstOffset - job.staging.offset), copy.size);
-    }
+    WriteBackDownloads(job.arena_base, job.copies, job.staging.mapped, job.staging.offset);
     const bool unmarked = memory_tracker->TryUnmarkRegionAsGpuModified(
         job.window, READBACK_WINDOW_SIZE, job.write_seq);
     {
@@ -434,7 +452,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     EnsureResident(arena, first_block, last_block);
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
-        gpu_modified_ranges.Add(device_addr, size);
+        for (const auto& [lo, len] : memory->SubtractStackRanges(device_addr, size)) {
+            gpu_modified_ranges.Add(lo, len);
+        }
         runtime.NoteOpenWrite(device_addr, size);
     }
     return {arena, arena->Offset(device_addr)};

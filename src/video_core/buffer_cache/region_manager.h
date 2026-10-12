@@ -102,6 +102,10 @@ public:
     }
     explicit RegionManager() = default;
 
+    VAddr GetCpuAddress() const noexcept {
+        return cpu_addr;
+    }
+
     void SetCpuAddress(VAddr new_cpu_addr) {
         cpu_addr = new_cpu_addr;
     }
