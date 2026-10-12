@@ -136,6 +136,15 @@ constexpr vk::Format SurfaceFormat(AmdGpu::DataFormat data_format,
     return result;
 }
 
+// Non-asserting SurfaceFormat for guest data that may be garbage: eUndefined when the pair has no host format
+inline vk::Format TrySurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format) {
+    if (u32(data_format) >= 1 << amd_gpu_data_format_bit_size ||
+        u32(num_format) >= 1 << amd_gpu_number_format_bit_size) {
+        return vk::Format::eUndefined;
+    }
+    return surface_format_table[GetSurfaceFormatTableIndex(data_format, num_format)];
+}
+
 static inline bool IsFormatDepthCompatible(vk::Format fmt) {
     switch (fmt) {
     // 32-bit float compatible

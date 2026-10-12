@@ -67,6 +67,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       memory_tracker{std::make_unique<MemoryTracker>(tracker)},
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
+      loop_cap_buffer{instance, 0, 256, MemoryType::HostCached, "Loop Cap Buffer"},
       memory_semaphore{instance}, transfer_semaphore{instance} {
     const vk::BufferCreateInfo probe_ci = {
         .flags =
@@ -99,6 +100,12 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
 
+    std::memset(loop_cap_buffer.mapped_data.data(), 0, loop_cap_buffer.mapped_data.size());
+    loop_cap_buffer.Flush(0, loop_cap_buffer.SizeBytes());
+    if (const u32 cap = EmulatorSettings.GetComputeLoopCap()) {
+        LOG_WARNING(Render_Vulkan, "Workaround compute_loop_cap enabled: {} back edges", cap);
+    }
+
     if (EmulatorSettings.IsResidencyBitmap()) {
         resident_bits.resize((u64{blocks_per_arena_page} * NUM_ARENA_PAGES + 63) / 64);
     }
@@ -116,6 +123,41 @@ BufferCache::~BufferCache() = default;
 void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
+    }
+    ReportLoopCapHits();
+}
+
+void BufferCache::ReportLoopCapHits() {
+    const u32 cap = EmulatorSettings.GetComputeLoopCap();
+    if (cap == 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - loop_cap_last_check < std::chrono::seconds{1}) {
+        return;
+    }
+    loop_cap_last_check = now;
+    // The shaders only increment the counter, so the CPU never writes it back and cannot lose hits that land
+    // between the read and a reset
+    loop_cap_buffer.Invalidate(0, loop_cap_buffer.SizeBytes());
+    std::array<u32, 2> words{};
+    std::memcpy(words.data(), loop_cap_buffer.mapped_data.data(), sizeof(words));
+    const u32 new_hits = words[0] - loop_cap_hits_reported;
+    if (new_hits != 0 && loop_cap_hits_reported == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "Workaround compute_loop_cap hit: cs {:#x} stopped after {} back edges",
+                    words[1], cap);
+        loop_cap_last_report = now;
+    }
+    loop_cap_hits_reported = words[0];
+    loop_cap_hits_minute += new_hits;
+    if (loop_cap_hits_minute != 0 && now - loop_cap_last_report >= std::chrono::minutes{1}) {
+        LOG_WARNING(Render_Vulkan,
+                    "Workaround compute_loop_cap: {} capped invocations in the last minute "
+                    "(total {}, last cs {:#x})",
+                    loop_cap_hits_minute, loop_cap_hits_reported, words[1]);
+        loop_cap_hits_minute = 0;
+        loop_cap_last_report = now;
     }
 }
 

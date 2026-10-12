@@ -682,6 +682,16 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                                (stencil_ref_export_enable << 1) |
                                (regs.depth_shader_control.mask_export_enable << 2) |
                                (regs.depth_shader_control.coverage_to_mask_enable << 3);
+        // Per-game: GCN tests depth/stencil before the pixel shader when Z_ORDER asks for it, so fragments
+        // that fail never run. A Vulkan shader with storage writes needs EarlyFragmentTests for that; without
+        // it the writes of failing fragments land too (SotC deferred decals paint their whole box footprint
+        // into the G-buffer). Not with a depth, stencil ref or sample mask export (mrtz_mask bits 0-2): the
+        // tests need them
+        const auto z_order = regs.depth_shader_control.z_order;
+        info.hw.fs.early_fragment_tests =
+            EmulatorSettings.IsEarlyFragmentTestsFromZOrder() &&
+            (z_order == AmdGpu::ZOrder::EarlyZLateZ || z_order == AmdGpu::ZOrder::EarlyZReZ) &&
+            (info.hw.fs.mrtz_mask & 0b111) == 0;
         const auto& cb0_blend = regs.blend_control[0];
         if (cb0_blend.enable) {
             info.hw.fs.dual_source_blending =

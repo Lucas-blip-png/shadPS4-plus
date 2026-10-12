@@ -12,12 +12,43 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
+// ShaderMetaVersion 12: meta records the codegen settings key. ShaderMetaVersion 13: InfoPersistent gains
+// uses_loop_cap and sharp_tables, ImageResource the descriptor array fields, HwFragmentRuntimeInfo
+// early_fragment_tests (all stored raw)
 static constexpr u32 ShaderBinaryVersion = 14u;
-static constexpr u32 ShaderMetaVersion = 11u;
+static constexpr u32 ShaderMetaVersion = 13u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 
 namespace Vulkan {
+
+namespace {
+/// Emulator settings that change the generated SPIR-V. The disk cache is keyed only by the guest
+/// shader hash, so a shader compiled with other values must be recompiled, not loaded
+constexpr u32 LdsBarriersLargeGroupsBit = 46;
+
+u64 CodegenSettingsKey() {
+    return u64{EmulatorSettings.GetComputeLoopCap()} |
+           (u64{EmulatorSettings.IsLdsBarrierUniformReadlane()} << 33) |
+           (u64{EmulatorSettings.IsEarlyFragmentTestsFromZOrder()} << 34) |
+           (u64{Shader::DynamicTsharpArraySize()} << 35) | // 7 bits, at most 64
+           (u64{EmulatorSettings.IsWave64UniformBranches()} << 42) |
+           (u64{EmulatorSettings.IsWave64MissingLaneIdentity()} << 45) |
+           (u64{EmulatorSettings.IsLdsBarriersLargeGroups()} << LdsBarriersLargeGroupsBit);
+}
+
+/// lds_barriers_large_groups only changes compute shaders that use LDS in workgroups larger than
+/// one GCN wave, the same condition SharedMemoryBarrierPass applies, so toggling it keeps the
+/// other cached shaders valid
+bool LdsBarriersLargeGroupsAffects(const Shader::RuntimeInfo& runtime_info) {
+    if (runtime_info.hw_stage != Shader::HwStage::Compute) {
+        return false;
+    }
+    const auto& cs = runtime_info.hw.cs;
+    return cs.shared_memory_size != 0 &&
+           cs.workgroup_size[0] * cs.workgroup_size[1] * cs.workgroup_size[2] > 64;
+}
+} // namespace
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
@@ -70,6 +101,7 @@ void RegisterShaderMeta(const Shader::Info& info,
 
     meta.Write(Serialization::ShaderMetaVersion);
     meta.Write(Serialization::ShaderBinaryVersion);
+    meta.Write(CodegenSettingsKey());
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -107,11 +139,22 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
         return false;
     }
 
+    u64 codegen_key{};
+    meta.Read(codegen_key);
+    const u64 key_diff = codegen_key ^ CodegenSettingsKey();
+    constexpr u64 lds_barriers_mask = u64{1} << LdsBarriersLargeGroupsBit;
+    if ((key_diff & ~lds_barriers_mask) != 0) {
+        return false;
+    }
+
     u64 perm_hash_ar{};
     meta.Read(perm_hash_ar);
     meta.Read(perm_idx);
 
     spec.Deserialize(ar);
+    if ((key_diff & lds_barriers_mask) != 0 && LdsBarriersLargeGroupsAffects(spec.runtime_info)) {
+        return false;
+    }
     info.Deserialize(ar);
     return true;
 }

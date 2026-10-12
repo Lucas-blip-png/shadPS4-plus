@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <limits>
 
@@ -12,6 +14,7 @@
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/process.h"
 #include "core/memory.h"
 #include "shader_recompiler/resource.h"
 #include "shader_recompiler/runtime_info.h"
@@ -30,6 +33,7 @@
 #include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/texture_cache/tile.h"
 
 namespace Vulkan {
 
@@ -57,6 +61,39 @@ static SHAD_NO_INLINE void WarnInvalidTsharp(const AmdGpu::Image& tsharp,
 
 static SHAD_NO_INLINE void WarnMetadataTextureRead() {
     LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
+}
+
+/// dynamic_tsharp_array_size: why a table element cannot be sized, or null when it is safe. A table can
+/// hold T#s the guest has not written yet, and the texture cache asserts on layouts it cannot size
+static const char* UnsupportedTableElementLayout(const AmdGpu::Image& tsharp) {
+    const auto tile_mode = tsharp.GetTileMode();
+    if (!magic_enum::enum_contains(tile_mode)) {
+        return "reserved tile mode";
+    }
+    const auto array_mode = AmdGpu::GetArrayMode(tile_mode);
+    if (array_mode == AmdGpu::ArrayMode::ArrayLinearGeneral) {
+        return "linear general";
+    }
+    if (!AmdGpu::IsMacroTiled(array_mode)) {
+        return nullptr;
+    }
+    const auto data_fmt = tsharp.GetDataFmt();
+    if (AmdGpu::IsBlockCoded(data_fmt)) {
+        return "block-compressed format on a macro-tiled mode";
+    }
+    // GetMacroTileExtents asserts above 8 samples and indexes its table by log2(bpp) - 3
+    const u32 samples = tsharp.NumSamples();
+    const u32 bpp = AmdGpu::NumBitsPerBlock(data_fmt);
+    if (samples > 8 || bpp < 8 || bpp > 128) {
+        return "macro-tiled mode with an unsupported sample count or bpp";
+    }
+    const bool alt = Libraries::Kernel::sceKernelIsNeoMode() && tsharp.alt_tile_mode;
+    const auto [pitch_align, height_align] =
+        VideoCore::GetMacroTileExtents(tile_mode, bpp, samples, alt);
+    if (pitch_align == 0 || height_align == 0) {
+        return "macro-tiled mode without tile extents";
+    }
+    return nullptr;
 }
 
 // The assertion macro's body; it returns, as the macro does.
@@ -2111,6 +2148,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const auto* fault_buffer = buffer_cache.GetFaultBuffer();
                 buffer_infos[info_n++] =
                     vk::DescriptorBufferInfo{fault_buffer->Handle(), 0, fault_buffer->SizeBytes()};
+            } else if (desc.buffer_type == Shader::BufferType::LoopCapBuffer) {
+                const auto* loop_cap_buffer = buffer_cache.GetLoopCapBuffer();
+                buffer_infos[info_n++] = vk::DescriptorBufferInfo{
+                    loop_cap_buffer->Handle(), 0, loop_cap_buffer->SizeBytes()};
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = liverpool->GetCsRegs();
@@ -2204,6 +2245,116 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         // declared for this image, or every later binding number in this stage
         // and in the stages after it drifts off the layout.
         const u32 num_bindings = image_desc.NumBindings(tsharp);
+        if (image_desc.array_size != 0) [[unlikely]] {
+            // Per-game dynamic_tsharp_array_size: one binding per table element, then a null one for
+            // out-of-range indices. The shader was typed after `tsharp`, the first valid element, so
+            // elements of another view type or number class stay null. The elements skip the image memo
+            // (like the eager mip fallback views) but still consume their hint ordinals
+            SkipImageHints(num_bindings);
+            const auto view_type = tsharp.GetViewType(image_desc.is_array);
+            const bool is_integer = AmdGpu::IsInteger(tsharp.GetNumberFmt());
+            u32 null_elements = 0;
+            for (u32 i = 0; i < num_bindings; ++i) {
+                const AmdGpu::Image element = i < image_desc.array_size
+                                                  ? image_desc.GetElementSharp(stage, i)
+                                                  : AmdGpu::Image::Null(image_desc.is_depth);
+                bool bindable = element && element.GetViewType(image_desc.is_array) == view_type &&
+                                AmdGpu::IsInteger(element.GetNumberFmt()) == is_integer &&
+                                element.GetNumberConversion() == tsharp.GetNumberConversion() &&
+                                element.GetDataFmt() != AmdGpu::DataFormat::FormatInvalid;
+                if (bindable) {
+                    const auto data_fmt = element.GetDataFmt();
+                    const auto num_fmt = element.GetNumberFmt();
+                    if (texture_cache.IsMeta(element.Address())) [[unlikely]] {
+                        WarnMetadataTextureRead();
+                    }
+                    // The warnings of these rejections are capped: a garbage T# left in a table is
+                    // rebound every draw
+                    static std::atomic<u32> rejection_warnings{0};
+                    constexpr u32 MaxRejectionWarnings = 32;
+                    const char* layout_reason = nullptr;
+                    if (!memory->IsValidGpuMapping(element.Address(), 0) ||
+                        !magic_enum::enum_contains(data_fmt) ||
+                        !magic_enum::enum_contains(num_fmt)) {
+                        if (rejection_warnings.fetch_add(1, std::memory_order_relaxed) <
+                            MaxRejectionWarnings) {
+                            WarnInvalidTsharp(element, data_fmt, num_fmt);
+                        }
+                        bindable = false;
+                    } else if (!memory->IsValidMapping(element.Address(), 0)) {
+                        // A garbage T# with a low address passes the 40-bit check above; no guest
+                        // memory lies below the first region of the address space
+                        bindable = false;
+                    } else if (const auto vk_fmt = LiverpoolToVK::TrySurfaceFormat(data_fmt, num_fmt);
+                               vk_fmt == vk::Format::eUndefined ||
+                               (image_desc.is_depth && vk_fmt != vk::Format::eR32Sfloat &&
+                                vk_fmt != vk::Format::eR32Uint &&
+                                vk_fmt != vk::Format::eR16Unorm)) {
+                        // A valid format pair with no host format (or no depth promotion) would assert
+                        // in ImageInfo
+                        bindable = false;
+                    } else if ((layout_reason = UnsupportedTableElementLayout(element))) {
+                        if (rejection_warnings.fetch_add(1, std::memory_order_relaxed) <
+                            MaxRejectionWarnings) {
+                            LOG_WARNING(Render_Vulkan,
+                                        "Rejecting T# with an unsupported layout ({}) address={:#x}, "
+                                        "width={}, tiling_index={}, data_format={}, samples={}",
+                                        layout_reason, element.Address(), u32(element.width),
+                                        u32(element.tiling_index), static_cast<u32>(data_fmt),
+                                        element.NumSamples());
+                        }
+                        bindable = false;
+                    }
+                }
+                if (!bindable) {
+                    null_elements += i < image_desc.array_size;
+                    image_bindings.emplace_back();
+                    continue;
+                }
+                ImageBinding& slot = image_bindings.emplace_back();
+                std::construct_at(&slot.desc, element, image_desc);
+                {
+                    // A garbage T# can still describe an image Vulkan cannot create; bind it as null
+                    const auto& limits = instance.GetLimits();
+                    const auto& info = slot.desc.Info();
+                    const bool is_3d = info.type == AmdGpu::ImageType::Color3D;
+                    const u32 max_dim =
+                        is_3d ? limits.maxImageDimension3D : limits.maxImageDimension2D;
+                    const u32 block_dim = info.props.is_block ? 4 : 1;
+                    const u64 host_bytes = u64{(info.size.width + block_dim - 1) / block_dim} *
+                                           ((info.size.height + block_dim - 1) / block_dim) *
+                                           info.size.depth * info.resources.layers *
+                                           std::max(info.num_samples, 1u) *
+                                           std::max(info.num_bits / 8, 1u);
+                    constexpr u64 MaxPlausibleImageBytes = 2ULL << 30;
+                    if (info.size.width > max_dim || info.size.height > max_dim ||
+                        (is_3d && info.size.depth > max_dim) ||
+                        info.resources.layers > limits.maxImageArrayLayers ||
+                        host_bytes > MaxPlausibleImageBytes) {
+                        null_elements += i < image_desc.array_size;
+                        std::construct_at(&slot);
+                        continue;
+                    }
+                }
+                auto& [image_id, desc] = slot;
+                image_id = texture_cache.FindImage(desc);
+                auto* image = &texture_cache.GetImage(image_id);
+                if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
+                    // A stencil attachment: redirect the access to the depth-stencil buffer
+                    image_id = depth_image_id;
+                    image = &texture_cache.GetImage(image_id);
+                }
+                if (image->binding.is_bound) {
+                    image->binding.force_general |= image_desc.is_written;
+                }
+                image->binding.is_bound = 1u;
+            }
+            ReportTsharpArray(stage.pgm_hash, image_desc.array_size, null_elements);
+            if (!plan_hit_) {
+                image_descriptor_array_sizes.push_back(num_bindings);
+            }
+            continue;
+        }
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
         // A null or format-less T# is rejected in every mode: the memo cannot
         // hold one, and a scene of unbound slots must not depress its hit ratio.
@@ -2442,6 +2593,27 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         set_write.descriptorCount = static_cast<u32>(stage.samplers.size());
         set_write.descriptorType = vk::DescriptorType::eSampler;
         set_write.pImageInfo = image_infos.data() + first_sampler_info;
+    }
+}
+
+void Rasterizer::ReportTsharpArray(u64 pgm_hash, u32 num_elements, u32 null_elements) {
+    const auto now = std::chrono::steady_clock::now();
+    if (tsharp_array_binds_minute == 0 && tsharp_array_last_report == decltype(now){}) {
+        LOG_WARNING(Render_Vulkan,
+                    "Workaround dynamic_tsharp_array_size: shader {:#x} binds {} T#s, {} null",
+                    pgm_hash, num_elements, null_elements);
+        tsharp_array_last_report = now;
+    }
+    ++tsharp_array_binds_minute;
+    tsharp_array_null_minute += null_elements;
+    if (now - tsharp_array_last_report >= std::chrono::minutes{1}) {
+        LOG_WARNING(Render_Vulkan,
+                    "Workaround dynamic_tsharp_array_size: {} T# arrays bound in the last minute, "
+                    "{} null elements",
+                    tsharp_array_binds_minute, tsharp_array_null_minute);
+        tsharp_array_binds_minute = 0;
+        tsharp_array_null_minute = 0;
+        tsharp_array_last_report = now;
     }
 }
 

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -53,6 +54,11 @@ public:
     /// Returns a pointer to GDS device local buffer.
     [[nodiscard]] const Buffer* GetGdsBuffer() const noexcept {
         return &gds_buffer;
+    }
+
+    /// Retrieves the compute_loop_cap hit counter buffer
+    [[nodiscard]] const Buffer* GetLoopCapBuffer() const noexcept {
+        return &loop_cap_buffer;
     }
 
     /// Retrieves the device local DBA page table buffer.
@@ -118,6 +124,9 @@ public:
     }
 
 private:
+    /// Logs compute_loop_cap hits: the first one, then a count per minute
+    void ReportLoopCapHits();
+
     struct ArenaBinds {
         const Buffer* arena;
         boost::container::small_vector<vk::SparseMemoryBind, 32> binds;
@@ -194,6 +203,12 @@ private:
 
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
+    /// compute_loop_cap: [0] = invocations that reached the cap, [1] = last capped shader hash
+    Buffer loop_cap_buffer;
+    u32 loop_cap_hits_reported{};
+    u32 loop_cap_hits_minute{};
+    std::chrono::steady_clock::time_point loop_cap_last_check{};
+    std::chrono::steady_clock::time_point loop_cap_last_report{};
     RangeSet gpu_modified_ranges;
 
     std::unique_ptr<FaultManager> fault_manager;

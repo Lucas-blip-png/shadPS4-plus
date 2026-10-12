@@ -837,6 +837,9 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
     case BufferType::SharedMemory:
         Name(id, "ssbo_shmem");
         break;
+    case BufferType::LoopCapBuffer:
+        Name(id, "loop_cap_buffer");
+        break;
     default:
         Name(id, fmt::format("ssbo_{}", binding.buffer));
         break;
@@ -860,6 +863,8 @@ void EmitContext::DefineBuffers() {
             bda_pagetable_index = buffers.size();
         } else if (desc.buffer_type == BufferType::FaultBuffer) {
             fault_buffer_index = buffers.size();
+        } else if (desc.buffer_type == BufferType::LoopCapBuffer) {
+            loop_cap_buffer_index = buffers.size();
         }
 
         // Define aliases depending on the shader usage.
@@ -1001,8 +1006,13 @@ void EmitContext::DefineImagesAndSamplers() {
 
         const u32 num_bindings = image_desc.NumBindings(info);
         Id pointee_type = image_type;
-        if (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex) {
+        if (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex ||
+            image_desc.array_size != 0) {
             pointee_type = TypeArray(pointee_type, ConstU32(num_bindings));
+        }
+        if (image_desc.array_size != 0) {
+            // The element index comes from the guest's table
+            AddCapability(spv::Capability::SampledImageArrayDynamicIndexing);
         }
 
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, pointee_type)};
@@ -1020,6 +1030,7 @@ void EmitContext::DefineImagesAndSamplers() {
             .is_integer = is_integer,
             .is_storage = is_storage,
             .mip_fallback_mode = mip_fallback_mode,
+            .array_size = image_desc.array_size,
         });
         interfaces.push_back(id);
     }

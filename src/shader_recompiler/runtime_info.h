@@ -209,7 +209,10 @@ struct HwFragmentRuntimeInfo {
     u32 dual_source_blending : 1;
     u32 clip_distance_emulation : 1;
     u32 depth_before_shader : 1;
-    u32 : 12;
+    /// Per-game early_fragment_tests_from_z_order: the guest runs depth/stencil before the pixel shader
+    /// (DB_SHADER_CONTROL.Z_ORDER early, no Z export)
+    u32 early_fragment_tests : 1;
+    u32 : 11;
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
         // Scalar compares run before the array walks so mismatches reject cheaply.
@@ -220,6 +223,7 @@ struct HwFragmentRuntimeInfo {
                dual_source_blending == other.dual_source_blending &&
                clip_distance_emulation == other.clip_distance_emulation &&
                depth_before_shader == other.depth_before_shader &&
+               early_fragment_tests == other.early_fragment_tests &&
                std::ranges::equal(color_buffers, other.color_buffers) &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);

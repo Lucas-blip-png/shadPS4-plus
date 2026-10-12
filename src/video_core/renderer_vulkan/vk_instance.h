@@ -345,6 +345,11 @@ public:
         return properties.pipelineCacheUUID;
     }
 
+    /// Returns the physical device limits
+    const vk::PhysicalDeviceLimits& GetLimits() const {
+        return properties.limits;
+    }
+
     /// Returns the minimum required alignment for uniforms
     vk::DeviceSize UniformMinAlignment() const {
         return properties.limits.minUniformBufferOffsetAlignment;
