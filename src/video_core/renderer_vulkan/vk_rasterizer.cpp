@@ -2285,6 +2285,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         // A garbage T# with a low address passes the 40-bit check above; no guest
                         // memory lies below the first region of the address space
                         bindable = false;
+                    } else if (const auto vk_fmt = LiverpoolToVK::TrySurfaceFormat(data_fmt, num_fmt);
+                               vk_fmt == vk::Format::eUndefined ||
+                               (image_desc.is_depth && vk_fmt != vk::Format::eR32Sfloat &&
+                                vk_fmt != vk::Format::eR32Uint &&
+                                vk_fmt != vk::Format::eR16Unorm)) {
+                        // A valid format pair with no host format (or no depth promotion) would assert
+                        // in ImageInfo
+                        bindable = false;
                     } else if ((layout_reason = UnsupportedTableElementLayout(element))) {
                         if (rejection_warnings.fetch_add(1, std::memory_order_relaxed) <
                             MaxRejectionWarnings) {
