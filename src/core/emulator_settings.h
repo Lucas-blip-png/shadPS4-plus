@@ -486,6 +486,8 @@ struct GPUSettings {
     // Look at the CPU modified bits of a read-only bind before taking the tracker lock, and skip
     // the locked walk over them when none is set.
     Setting<bool> clean_sync_peek{true};
+    // VRAM reserved at boot for guest memory the GPU uses, in MB (0 = allocated as needed)
+    Setting<u32> arena_reserve_mb{0};
     // The GPU command thread submits a readback download without waiting for it; the faulting
     // thread waits and writes the bytes back. A GPU write marked in the window meanwhile keeps
     // the window GPU modified for the next fault.
@@ -792,6 +794,7 @@ struct GPUSettings {
             GPU_OVERRIDE(residency_bitmap),
             GPU_OVERRIDE(stream_barrier_skip),
             GPU_OVERRIDE(clean_sync_peek),
+            GPU_OVERRIDE(arena_reserve_mb),
             GPU_OVERRIDE(readback_offload),
             GPU_OVERRIDE(ring_drain_flush_draws),
             GPU_OVERRIDE(pending_pop_throttle),
@@ -906,7 +909,8 @@ struct GPUSettings {
     lds_barriers_large_groups, compute_loop_cap, early_fragment_tests_from_z_order, \
     dynamic_tsharp_array_size, \
     preserve_split_protection, \
-    lod_stats_from_bindings
+    lod_stats_from_bindings, \
+    clean_sync_peek, arena_reserve_mb, readback_offload, real_occlusion_queries, threaded_cmd_recording, compute_fast_compile, compute_fast_compile_force, readback_transfer_queue
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1234,6 +1238,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ResidencyBitmap, residency_bitmap)
     SETTING_FORWARD_BOOL(m_gpu, StreamBarrierSkip, stream_barrier_skip)
     SETTING_FORWARD_BOOL(m_gpu, CleanSyncPeek, clean_sync_peek)
+    SETTING_FORWARD(m_gpu, ArenaReserveMb, arena_reserve_mb)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackOffload, readback_offload)
     SETTING_FORWARD(m_gpu, RingDrainFlushDraws, ring_drain_flush_draws)
     SETTING_FORWARD(m_gpu, PendingPopThrottle, pending_pop_throttle)
